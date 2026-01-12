@@ -1,18 +1,47 @@
 services:
+  mysql:
+    image: mysql:8.0
+    container_name: yeastar-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: yeastar_root_2024
+      MYSQL_DATABASE: yeastar_crm
+      MYSQL_USER: yeastar
+      MYSQL_PASSWORD: yeastar_pass_2024
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   ai-transcription:
     image: nvcr.io/nvidia/pytorch:25.11-py3
     container_name: yeastar-ai
     network_mode: host
+    depends_on:
+      mysql:
+        condition: service_healthy
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
       - HF_HOME=/workspace/huggingface
-      # Optional: HuggingFace token for speaker diarization (who said what)
-      # To enable: 1) Get token from https://huggingface.co/settings/tokens
-      #            2) Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1
-      #            3) Add: pip install pyannote-audio soundfile (in command below)
-      #            4) Set HF_TOKEN=your_token_here
       - HF_TOKEN=${HF_TOKEN:-}
+      - DB_HOST=127.0.0.1
+      - DB_PORT=3306
+      - DB_NAME=yeastar_crm
+      - DB_USER=yeastar
+      - DB_PASSWORD=yeastar_pass_2024
+      - SECRET_KEY=nexture-yeastar-secret-key-2024
+      - YEASTAR_HOST=alquozgtc.ras.yeastar.com
+      - YEASTAR_PORT=443
+      - YEASTAR_USERNAME=admin
+      - YEASTAR_PASSWORD=P@ssw0rd123
+      - YEASTAR_CLIENT_ID=B8wFfDNwuu2CguKV1HCehwwgsMVsrWeG
+      - YEASTAR_CLIENT_SECRET=EoOKDu8qNGLljq4sfscE8096Zv5tYH6X
     volumes:
       - ./backend:/workspace/backend
       - ./ai_models:/workspace/models
@@ -20,7 +49,7 @@ services:
     working_dir: /workspace
     command: >
       bash -c "apt-get update && apt-get install -y ffmpeg libsndfile1 &&
-      pip install faster-whisper httpx fastapi uvicorn sqlalchemy pydantic-settings python-jose passlib bcrypt websockets aiofiles transformers accelerate &&
+      pip install faster-whisper httpx fastapi uvicorn sqlalchemy pymysql cryptography pydantic-settings python-jose passlib bcrypt websockets aiofiles transformers accelerate python-multipart &&
       cd /workspace/backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
     deploy:
       resources:
@@ -32,3 +61,4 @@ services:
 
 volumes:
   huggingface_cache:
+  mysql_data:
