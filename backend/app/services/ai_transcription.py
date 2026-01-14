@@ -20,6 +20,100 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Staff extension mapping - maps extensions to staff details
+STAFF_EXTENSION_MAP = {
+    # Call Centre Team
+    "201": {"name": "Jijina", "department": "Call Centre", "role": "Call Centre Agent"},
+    "202": {"name": "Joanna", "department": "Call Centre", "role": "Call Centre Agent"},
+    "203": {"name": "Ramshad", "department": "Call Centre", "role": "Call Centre Agent"},
+    # Sales Team
+    "207": {"name": "Saumil", "department": "Sales", "role": "Sales Agent"},
+    "208": {"name": "Pranay", "department": "Sales", "role": "Sales Agent"},
+    "209": {"name": "Sai", "department": "Sales", "role": "Sales Agent"},
+}
+
+def get_staff_from_extension(extension: str) -> dict:
+    """Get staff details from extension number."""
+    if extension:
+        # Clean extension - remove any prefix
+        ext_clean = str(extension).strip()
+        if ext_clean in STAFF_EXTENSION_MAP:
+            return STAFF_EXTENSION_MAP[ext_clean]
+    return {"name": None, "department": "Unknown", "role": "Unknown"}
+
+
+def is_valid_transcript_for_analysis(transcript: str) -> tuple[bool, str]:
+    """
+    Check if transcript has enough meaningful content for AI analysis.
+
+    Returns:
+        tuple: (is_valid, reason) - is_valid is True if transcript should be analyzed,
+               reason explains why it's invalid if False
+    """
+    import re
+
+    if not transcript:
+        return False, "Empty transcript"
+
+    cleaned = transcript.strip()
+
+    # Check minimum character length
+    if len(cleaned) < 20:
+        return False, "Transcript too short"
+
+    # Remove speaker labels and timestamps for word counting
+    text_only = re.sub(r'\[SPEAKER_\d+\]:', '', cleaned)
+    text_only = re.sub(r'\[\d+:\d+\]', '', text_only)
+    text_only = re.sub(r'\[.*?\]', '', text_only)  # Remove any bracketed content
+    text_only = text_only.strip()
+
+    # Count meaningful words (at least 2 characters, not just punctuation)
+    words = [w for w in text_only.split() if len(w) >= 2 and re.search(r'[a-zA-Z]', w)]
+    word_count = len(words)
+
+    # Need at least 5 meaningful words for analysis
+    if word_count < 5:
+        return False, f"Insufficient content ({word_count} words)"
+
+    # Check for noise patterns - transcriptions that are just ring tones, music, or silence
+    noise_patterns = [
+        r'^[\s\.\,\!\?\-]+$',  # Only punctuation
+        r'^(ring|ringing|beep|tone|music|silence|noise|static|hum|buzz|click)+[\s\,\.]*$',
+        r'^(uh|um|hmm|ah|oh|eh|er)+[\s\,\.]*$',  # Only filler sounds
+        r'^(hello|hi|hey|bye|goodbye|thank you|thanks|okay|ok|yes|no|yeah|yep|nope)[\s\,\.!?]*$',  # Only single greeting/farewell
+    ]
+
+    text_lower = text_only.lower().strip()
+    for pattern in noise_patterns:
+        if re.match(pattern, text_lower, re.IGNORECASE):
+            return False, "Transcript contains only noise or minimal interaction"
+
+    # Check if transcript is just repeated words (e.g., "hello hello hello" from ring back tone)
+    unique_words = set(w.lower() for w in words if len(w) >= 3)
+    if len(unique_words) < 3 and word_count >= 5:
+        return False, "Transcript contains repetitive non-conversational content"
+
+    # Check for actual conversational indicators
+    conversational_indicators = [
+        r'\b(what|how|when|where|why|who|can|could|would|should|is|are|do|does|have|has)\b',  # Question words
+        r'\b(please|need|want|help|service|visa|id|emirates|company|license|document|appointment)\b',  # Service-related
+        r'\b(yes|no|okay|sure|right|correct|exactly|understand)\b',  # Conversational responses
+        r'\b(sir|madam|mam|mr|mrs|miss)\b',  # Polite address
+        r'\b(call|calling|phone|number|contact|reach)\b',  # Call-related
+        r'\b(thank|thanks|welcome|sorry|excuse)\b',  # Politeness markers
+    ]
+
+    has_conversation = False
+    for pattern in conversational_indicators:
+        if re.search(pattern, text_lower):
+            has_conversation = True
+            break
+
+    if not has_conversation and word_count < 15:
+        return False, "Transcript lacks conversational content"
+
+    return True, "Valid transcript"
+
 # Summary prompt template - detailed business-specific analysis with speaker identification
 SUMMARY_PROMPT_TEMPLATE = """Analyze this phone call transcript between a STAFF member and a CUSTOMER.
 
@@ -27,35 +121,58 @@ SUMMARY_PROMPT_TEMPLATE = """Analyze this phone call transcript between a STAFF 
 COMPANY CONTEXT - OUR BUSINESSES:
 ═══════════════════════════════════════════════════════════════════════════════
 
-1. AMER ALQUOZ CENTRE / AMER ALBARSHA MALL (Government Authorized Service Centre)
-   Location: Dubai, UAE
+1. AMER ALQUOZ GTC (Government Transaction Centre)
+   Location: Al Barsha Mall, Al Barsha, Dubai, UAE
+   Brand Names: Amer Centre, Amer Alquoz, Amer Al Barsha Mall
    Services:
-   - Emirates ID services (new, renewal, replacement, status check)
-   - Visa services (tourist visa, visit visa, residence visa, Golden Visa, work permit)
-   - Attestation services (certificate attestation, document legalization, MOFA attestation)
-   - Typing services (application forms, government documents)
-   - Medical fitness test coordination
-   - Entry permits and visa stamping
+   - Emirates ID services (new application, renewal, replacement, lost ID, status check, biometric update)
+   - Visa services (tourist visa, visit visa, residence visa, Golden Visa, Green Visa, work permit, visa renewal, visa cancellation)
+   - Attestation services (certificate attestation, document legalization, MOFA attestation, embassy attestation)
+   - Typing services (application forms, government documents, legal typing)
+   - Medical fitness test coordination and appointment booking
+   - Entry permits and visa stamping (inside/outside country change status)
    - ICP (Federal Authority for Identity & Citizenship) related services
    - PRO services (Public Relations Officer services)
    - Labor card and work permit services
-   - Family visa sponsorship
+   - Family visa sponsorship and dependent visa
+   - Tasheel services
+   - GDRFA (General Directorate of Residency and Foreigners Affairs) services
 
-2. NEXTURE CORPORATE SERVICES (Business Setup & Corporate Services)
-   Location: Dubai, UAE
+2. NEXTURE CORPORATE SERVICES LLC
+   Location: I-Rise Tower, Tecom, Barsha Heights, Dubai, UAE
+   Brand Names: Nexture, Nexture Corporate, Nexture Business Setup
    Services:
-   - Company formation (Mainland, Free Zone, Offshore)
-   - Trade license (new, renewal, amendment)
-   - Business registration and licensing
+   - Company formation (Mainland LLC, Free Zone, Offshore, Branch office)
+   - Trade license services (new license, renewal, amendment, activity addition)
+   - Business registration and DED licensing
    - Corporate bank account opening assistance
-   - Office space and Flexi-desk solutions
+   - Office space solutions (Flexi-desk, virtual office, co-working space)
    - Corporate PRO services
-   - Investor visa and partner visa
-   - Business consultation
+   - Investor visa and partner visa processing
+   - Business consultation and advisory
    - Company liquidation and deregistration
-   - VAT registration and compliance
+   - VAT registration, filing, and compliance
+   - Corporate tax registration and compliance
    - Corporate tie-ups and partnerships
-   - Real estate license services
+   - Real estate license services (broker, developer)
+   - Import/export code registration
+   - Ejari and tenancy contract services
+
+═══════════════════════════════════════════════════════════════════════════════
+STAFF EXTENSION DIRECTORY:
+═══════════════════════════════════════════════════════════════════════════════
+Call Centre Team:
+- Extension 201: Jijina (Call Centre Agent)
+- Extension 202: Joanna (Call Centre Agent)
+- Extension 203: Ramshad (Call Centre Agent)
+
+Sales Team:
+- Extension 207: Saumil (Sales Agent)
+- Extension 208: Pranay (Sales Agent)
+- Extension 209: Sai (Sales Agent)
+
+Use this mapping to identify staff if extension is mentioned or visible in recording filename.
+The recording filename format includes the extension: e.g., "20251211-201-Outbound.wav" means extension 201 (Jijina).
 
 ═══════════════════════════════════════════════════════════════════════════════
 SPEAKER IDENTIFICATION RULES:
@@ -65,6 +182,7 @@ SPEAKER IDENTIFICATION RULES:
 - If someone asks about visa/Emirates ID/company setup services, they are CUSTOMER
 - The person providing information/solutions is STAFF
 - The person asking questions/requesting services is CUSTOMER
+- Match staff names from the extension directory if identifiable
 
 ═══════════════════════════════════════════════════════════════════════════════
 TRANSCRIPT:
@@ -72,69 +190,140 @@ TRANSCRIPT:
 {transcript}
 
 ═══════════════════════════════════════════════════════════════════════════════
-ANALYSIS REQUIRED - Return JSON:
+RECORDING CONTEXT (if available):
+═══════════════════════════════════════════════════════════════════════════════
+{recording_context}
+
+═══════════════════════════════════════════════════════════════════════════════
+COMPREHENSIVE ANALYSIS - Return JSON:
 ═══════════════════════════════════════════════════════════════════════════════
 {{
-    "call_type": "visa_inquiry|emirates_id|attestation|company_setup|trade_license|golden_visa|follow_up|complaint|consultation|support|general_inquiry|otp_verification|internal|other",
+    "call_type": "visa_inquiry|emirates_id|attestation|company_setup|trade_license|golden_visa|green_visa|follow_up|complaint|consultation|support|general_inquiry|otp_verification|appointment_booking|status_check|document_collection|payment_inquiry|callback_request|internal|spam|wrong_number|other",
     "service_category": "Amer Centre Services|Nexture Corporate Services|Both|Unknown",
+    "service_subcategory": "Specific service like 'Golden Visa', 'Trade License Renewal', 'Emirates ID Status', etc.",
     "summary": "2-3 sentence summary: What did CUSTOMER want? How did STAFF help? What was the outcome?",
 
-    "staff_name": "Name of staff member if mentioned, otherwise null",
+    "staff_name": "Name of staff member (use extension directory if identifiable), otherwise null",
+    "staff_extension": "Extension number if identifiable from recording or conversation, otherwise null",
+    "staff_department": "Call Centre|Sales|Unknown based on extension directory",
     "customer_name": "Name of customer if mentioned, otherwise null",
+    "customer_phone": "Customer's phone number if mentioned, formatted as +971-XX-XXX-XXXX",
     "company_name": "Customer's company name if mentioned (for corporate clients), otherwise null",
 
-    "topics_discussed": ["List specific topics: e.g., 'Golden Visa renewal', 'Trade license amendment', 'Emirates ID status'"],
-    "customer_requests": ["Specific requests: e.g., 'Check visa status', 'Process Emirates ID renewal', 'Get OTP for transaction'"],
+    "topics_discussed": ["List specific topics: e.g., 'Golden Visa eligibility', 'Trade license amendment process', 'Emirates ID renewal documents required'"],
+    "customer_requests": ["Specific requests: e.g., 'Check visa status for application #12345', 'Get quote for mainland company setup', 'Schedule appointment for biometrics'"],
     "staff_responses": ["How staff addressed each request with specific details provided"],
-    "action_items": ["Follow-up actions: e.g., 'Customer to submit documents on WhatsApp', 'Staff to call back with update'"],
+    "action_items": ["Follow-up actions with owner: e.g., 'Customer to send passport copy on WhatsApp', 'Staff to email quotation', 'Customer to visit branch on Monday'"],
+    "commitments_made": ["Promises made by staff: e.g., 'Will call back within 2 hours', 'Will send documents by email today'"],
 
-    "resolution_status": "resolved|pending|escalated|requires_followup|unclear",
+    "resolution_status": "resolved|pending|escalated|requires_followup|transferred|callback_scheduled|unclear",
 
     "key_details": {{
-        "application_numbers": ["Any application/reference numbers mentioned (format: as-is from call)"],
-        "phone_numbers": ["Format ALL as +971-XX-XXX-XXXX for UAE numbers, or with country code for others"],
-        "amounts_mentioned": ["Any fees/costs mentioned with currency (e.g., 'AED 500', '1000 dirhams')"],
+        "application_numbers": ["Any application/reference/file numbers mentioned"],
+        "transaction_ids": ["Any transaction or receipt numbers"],
+        "phone_numbers": ["Format ALL as +971-XX-XXX-XXXX for UAE numbers"],
+        "email_addresses": ["Any email addresses mentioned"],
+        "amounts_mentioned": ["Any fees/costs with currency (e.g., 'AED 500', '1000 dirhams')"],
         "dates_deadlines": ["Any dates, deadlines, or timeframes mentioned"],
-        "document_types": ["Documents mentioned: passport, Emirates ID, visa copy, trade license, etc."],
-        "locations": ["Locations mentioned: branches, offices, government departments"],
+        "document_types": ["Documents mentioned: passport, Emirates ID, visa copy, trade license, MOA, etc."],
+        "locations": ["Locations mentioned: branches, offices, government departments, free zones"],
+        "passport_numbers": ["Any passport numbers mentioned (partial is fine)"],
+        "emirates_id_numbers": ["Any Emirates ID numbers mentioned"],
+        "company_license_numbers": ["Any trade license or company registration numbers"],
+        "visa_file_numbers": ["Any visa file numbers or permit numbers"],
         "other_details": ["Any other critical information"]
+    }},
+
+    "call_classification": {{
+        "is_sales_opportunity": true/false,
+        "lead_quality": "hot|warm|cold|not_applicable",
+        "lead_source": "new_inquiry|referral|repeat_customer|marketing_campaign|unknown",
+        "estimated_deal_value": "Amount in AED if discussed, otherwise null",
+        "conversion_likelihood": "high|medium|low|not_applicable",
+        "competitor_mentioned": "Name of any competitor mentioned, otherwise null",
+        "urgency_level": "immediate|within_week|within_month|no_urgency|unclear",
+        "decision_maker": true/false (is the caller the decision maker?),
+        "follow_up_required": true/false,
+        "follow_up_date": "Specific date if mentioned, otherwise null",
+        "lost_reason": "If opportunity lost, reason why (e.g., 'price too high', 'chose competitor', 'not ready')"
+    }},
+
+    "customer_profile": {{
+        "customer_type": "individual|corporate|government|vip|repeat_customer|new_customer",
+        "nationality": "Nationality if mentioned or identifiable",
+        "language_preference": "Language used: English|Arabic|Hindi|Malayalam|Urdu|Other",
+        "communication_channel_preference": "WhatsApp|Email|Phone|In-person|None mentioned",
+        "special_requirements": ["Any special needs or requests"],
+        "relationship_history": "first_contact|returning_customer|regular_client|vip|unknown"
     }},
 
     "mood_sentiment_analysis": {{
         "overall_sentiment": "positive|neutral|negative|mixed",
         "customer_mood": {{
-            "initial": "calm|anxious|frustrated|angry|confused|happy|neutral",
-            "final": "satisfied|relieved|still_frustrated|angry|neutral|happy|unclear",
+            "initial": "calm|anxious|frustrated|angry|confused|happy|neutral|impatient|worried",
+            "final": "satisfied|relieved|still_frustrated|angry|neutral|happy|unclear|appreciative|disappointed",
             "mood_change": "improved|worsened|unchanged|fluctuated"
         }},
         "staff_mood": {{
-            "tone": "professional|friendly|helpful|indifferent|rushed|irritated",
-            "patience_level": "excellent|good|adequate|low"
+            "tone": "professional|friendly|helpful|indifferent|rushed|irritated|warm|empathetic",
+            "patience_level": "excellent|good|adequate|low",
+            "energy_level": "high|moderate|low"
         }},
-        "call_atmosphere": "cordial|tense|rushed|collaborative|confrontational|neutral",
-        "frustration_indicators": ["List any signs of frustration: raised voice, repeated questions, complaints about waiting, etc."],
-        "satisfaction_indicators": ["List any signs of satisfaction: thanks, appreciation, positive acknowledgment, etc."]
+        "call_atmosphere": "cordial|tense|rushed|collaborative|confrontational|neutral|warm|frustrating",
+        "frustration_indicators": ["List any signs: raised voice, repeated questions, complaints, interruptions, etc."],
+        "satisfaction_indicators": ["List any signs: thanks, appreciation, positive acknowledgment, willingness to proceed, etc."],
+        "trust_indicators": ["Signs of trust: agreement to send documents, providing personal info, booking appointment, etc."]
     }},
 
     "employee_performance": {{
-        "greeting_quality": "professional|casual|poor|none",
+        "greeting_quality": "excellent|professional|casual|poor|none",
+        "introduction": "Did staff introduce themselves and company? yes|partial|no",
+        "active_listening": "excellent|good|adequate|poor",
         "knowledge_displayed": "excellent|good|adequate|poor",
-        "problem_resolution": "resolved|partially_resolved|not_resolved|not_applicable",
-        "communication_clarity": "clear|mostly_clear|unclear",
+        "problem_resolution": "resolved|partially_resolved|not_resolved|escalated|not_applicable",
+        "communication_clarity": "excellent|clear|mostly_clear|unclear|confusing",
         "customer_handling": "excellent|good|needs_improvement|poor",
         "empathy_shown": "high|moderate|low|none",
         "response_time_perception": "prompt|acceptable|slow|very_slow",
+        "proactive_suggestions": "Did staff offer additional helpful information? yes|partial|no",
+        "upselling_attempted": "Did staff suggest additional services? yes|no|not_applicable",
+        "closing_quality": "excellent|good|adequate|poor|abrupt",
         "follow_up_commitment": "yes_with_timeline|yes_vague|no|not_applicable",
+        "hold_time_handling": "Was customer put on hold appropriately? yes|no|excessive|not_applicable",
         "professionalism_score": "1-10 rating based on overall conduct",
-        "areas_for_improvement": ["Specific suggestions if any issues noted, otherwise empty array"],
-        "positive_highlights": ["What the employee did well, if anything notable"]
+        "knowledge_score": "1-10 rating based on service knowledge",
+        "communication_score": "1-10 rating based on communication skills",
+        "empathy_score": "1-10 rating based on emotional intelligence",
+        "overall_performance_score": "1-10 overall performance rating",
+        "areas_for_improvement": ["Specific actionable suggestions"],
+        "positive_highlights": ["What the employee did well"],
+        "coaching_notes": ["Notes for manager/supervisor to discuss with employee"]
+    }},
+
+    "compliance_check": {{
+        "data_protection": "Did staff handle personal data appropriately? yes|no|not_applicable",
+        "service_accuracy": "Was information provided accurate? yes|partially|no|cannot_verify",
+        "pricing_transparency": "Was pricing clearly communicated? yes|no|not_applicable",
+        "terms_explained": "Were terms and conditions mentioned? yes|no|not_applicable",
+        "inappropriate_promises": "Any inappropriate commitments made? none|list_if_any",
+        "escalation_protocol": "Was escalation handled correctly? yes|no|not_applicable"
+    }},
+
+    "call_quality_metrics": {{
+        "call_duration_assessment": "appropriate|too_short|too_long",
+        "first_call_resolution": true/false,
+        "transfer_required": true/false,
+        "callback_required": true/false,
+        "information_complete": "Was all required information gathered? yes|partial|no",
+        "customer_effort_score": "low|medium|high (how much effort did customer need to expend?)",
+        "likely_to_recommend": "likely|neutral|unlikely|cannot_assess"
     }}
 }}
 
 ═══════════════════════════════════════════════════════════════════════════════
 CRITICAL RULES:
 ═══════════════════════════════════════════════════════════════════════════════
-1. ONLY include information ACTUALLY said in the transcript - do not assume
+1. ONLY include information ACTUALLY said in the transcript - do not assume or fabricate
 2. If something wasn't mentioned, use null or empty array []
 3. PHONE NUMBER FORMAT:
    - UAE numbers: +971-50-XXX-XXXX, +971-55-XXX-XXXX, +971-4-XXX-XXXX
@@ -142,9 +331,13 @@ CRITICAL RULES:
    - International numbers: include country code
 4. DEDUPLICATION: If a number/name is repeated for confirmation, count it ONCE only
 5. OTP CALLS: If the call is primarily about OTP verification, mark call_type as "otp_verification"
-6. Be specific about services: "Golden Visa inquiry" not just "visa inquiry"
-7. MOOD ANALYSIS: Base mood assessment on actual tone indicators in transcript (urgency words, politeness, complaints, thanks)
-8. EMPLOYEE PERFORMANCE: Be objective and constructive - note both positives and areas for improvement
+6. Be SPECIFIC about services: "Golden Visa inquiry for property investment" not just "visa inquiry"
+7. MOOD ANALYSIS: Base mood assessment on actual tone indicators (urgency words, politeness, complaints, thanks)
+8. EMPLOYEE PERFORMANCE: Be objective and constructive - provide actionable feedback
+9. SALES OPPORTUNITIES: Identify potential business opportunities and qualify leads
+10. STAFF IDENTIFICATION: Use extension directory to identify staff when possible
+11. COMPLIANCE: Note any compliance concerns or data handling issues
+12. COACHING: Provide specific coaching notes that would help improve performance
 
 Return ONLY valid JSON, no other text."""
 
@@ -470,10 +663,13 @@ class LLMAnalysisService:
         except:
             return False
 
-    async def analyze_transcript(self, transcript: str) -> Dict[str, Any]:
+    async def analyze_transcript(self, transcript: str, recording_context: str = "") -> Dict[str, Any]:
         """Analyze call transcript and extract structured information."""
 
-        prompt = SUMMARY_PROMPT_TEMPLATE.format(transcript=transcript)
+        prompt = SUMMARY_PROMPT_TEMPLATE.format(
+            transcript=transcript,
+            recording_context=recording_context if recording_context else "No additional context available."
+        )
 
         # Determine which backend to use
         if self._use_vllm is None:
@@ -717,17 +913,47 @@ class AITranscriptionService:
         self,
         transcript: str,
         model: str = None,
+        recording_context: str = "",
     ) -> Dict[str, Any]:
         """Analyze transcript using Llama 3.1 8B."""
-        return await self._llm_service.analyze_transcript(transcript)
+        return await self._llm_service.analyze_transcript(transcript, recording_context)
 
     async def process_recording(
         self,
         audio_path: str,
         language_hint: Optional[str] = None,
+        recording_file: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Full pipeline: Transcribe and analyze."""
+        import re
         start_time = datetime.now()
+
+        # Extract extension from recording filename if available
+        extension = None
+        call_direction = None
+        recording_context = ""
+
+        filename = recording_file or os.path.basename(audio_path)
+        if filename:
+            # Pattern: 20251211160749-1765454864.23722-201-0556195159-Outbound.wav
+            # or: 20251211-201-Inbound-0501234567.wav
+            ext_match = re.search(r'-(\d{3})-', filename)
+            if ext_match:
+                extension = ext_match.group(1)
+                staff_info = get_staff_from_extension(extension)
+                if staff_info["name"]:
+                    recording_context = f"Extension: {extension}\nStaff Member: {staff_info['name']}\nDepartment: {staff_info['department']}\nRole: {staff_info['role']}"
+
+            # Extract direction
+            if "Outbound" in filename or "outbound" in filename:
+                call_direction = "outbound"
+                recording_context += f"\nCall Direction: Outbound (Staff initiated the call)"
+            elif "Inbound" in filename or "inbound" in filename:
+                call_direction = "inbound"
+                recording_context += f"\nCall Direction: Inbound (Customer called in)"
+            elif "Internal" in filename or "internal" in filename:
+                call_direction = "internal"
+                recording_context += f"\nCall Direction: Internal (Call between staff members)"
 
         # Step 1: Transcribe
         logger.info(f"Starting transcription for: {audio_path}")
@@ -749,23 +975,76 @@ class AITranscriptionService:
                 "stage": "transcription"
             }
 
+        # Validate if transcript has meaningful content for analysis
+        is_valid, validation_reason = is_valid_transcript_for_analysis(transcript)
+
+        if not is_valid:
+            logger.info(f"Transcript not valid for analysis: {validation_reason}")
+            # Get staff info for the response
+            staff_info_for_response = get_staff_from_extension(extension) if extension else {}
+            # Return success but with a special "insufficient data" response
+            return {
+                "success": True,
+                "transcript_preview": transcript[:500] + "..." if len(transcript) > 500 else transcript,
+                "full_transcript": transcript,
+                "language_detected": transcription.get("language"),
+                "summary": {
+                    "call_type": "insufficient_data",
+                    "summary": "Not enough data to generate analysis. The call may contain only ringing, background noise, or minimal interaction.",
+                    "service_category": "Unknown",
+                    "resolution_status": "unclear",
+                    "mood_sentiment_analysis": {
+                        "overall_sentiment": "neutral"
+                    },
+                    "insufficient_data_reason": validation_reason,
+                },
+                "summary_error": None,
+                "processing_time_seconds": round((datetime.now() - start_time).total_seconds(), 2),
+                "model_used": "none - insufficient data",
+                "asr_engine": "transformers-whisper-turbo",
+                "staff_extension": extension,
+                "staff_name": staff_info_for_response.get("name") if extension else None,
+                "staff_department": staff_info_for_response.get("department") if extension else None,
+                "call_direction": call_direction,
+                "analysis_skipped": True,
+                "analysis_skip_reason": validation_reason,
+            }
+
         logger.info(f"Transcription complete, analyzing with {settings.ollama_model}...")
 
-        # Step 2: Analyze
-        analysis = await self._llm_service.analyze_transcript(transcript)
+        # Step 2: Analyze with recording context
+        analysis = await self._llm_service.analyze_transcript(transcript, recording_context)
 
         processing_time = (datetime.now() - start_time).total_seconds()
+
+        # Get staff info from extension for the result
+        staff_info = get_staff_from_extension(extension) if extension else {}
+
+        # If analysis succeeded, enrich with extension-based staff info
+        summary_data = analysis.get("data") if analysis.get("success") else None
+        if summary_data and extension:
+            # Set staff info from extension if not already in analysis
+            if not summary_data.get("staff_extension"):
+                summary_data["staff_extension"] = extension
+            if not summary_data.get("staff_name") and staff_info.get("name"):
+                summary_data["staff_name"] = staff_info["name"]
+            if not summary_data.get("staff_department"):
+                summary_data["staff_department"] = staff_info.get("department", "Unknown")
 
         return {
             "success": True,
             "transcript_preview": transcript[:500] + "..." if len(transcript) > 500 else transcript,
             "full_transcript": transcript,
             "language_detected": transcription.get("language"),
-            "summary": analysis.get("data") if analysis.get("success") else None,
+            "summary": summary_data,
             "summary_error": analysis.get("error") if not analysis.get("success") else None,
             "processing_time_seconds": round(processing_time, 2),
             "model_used": self._llm_service.model if self._llm_service._use_vllm else self._llm_service.ollama_model,
             "asr_engine": "transformers-whisper-turbo",
+            "staff_extension": extension,
+            "staff_name": staff_info.get("name") if staff_info else None,
+            "staff_department": staff_info.get("department") if staff_info else None,
+            "call_direction": call_direction,
         }
 
     async def check_status(self) -> Dict[str, Any]:
