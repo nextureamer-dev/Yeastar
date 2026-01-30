@@ -27,9 +27,11 @@ STAFF_EXTENSION_MAP = {
     "202": {"name": "Joanna", "department": "Call Centre", "role": "Call Centre Agent"},
     "203": {"name": "Ramshad", "department": "Call Centre", "role": "Call Centre Agent"},
     # Sales Team
+    "111": {"name": "Amith", "department": "Sales", "role": "Sales Agent"},
     "207": {"name": "Saumil", "department": "Sales", "role": "Sales Agent"},
     "208": {"name": "Pranay", "department": "Sales", "role": "Sales Agent"},
     "209": {"name": "Sai", "department": "Sales", "role": "Sales Agent"},
+    "211": {"name": "Swaroop", "department": "Sales", "role": "Sales Agent"},
 }
 
 def get_staff_from_extension(extension: str) -> dict:
@@ -167,9 +169,11 @@ Call Centre Team:
 - Extension 203: Ramshad (Call Centre Agent)
 
 Sales Team:
+- Extension 111: Amith (Sales Agent)
 - Extension 207: Saumil (Sales Agent)
 - Extension 208: Pranay (Sales Agent)
 - Extension 209: Sai (Sales Agent)
+- Extension 211: Swaroop (Sales Agent)
 
 Use this mapping to identify staff if extension is mentioned or visible in recording filename.
 The recording filename format includes the extension: e.g., "20251211-201-Outbound.wav" means extension 201 (Jijina).
@@ -553,6 +557,13 @@ class WhisperEngine:
                 generate_kwargs = {}
                 if language:
                     generate_kwargs["language"] = language
+
+                # Add prompt to help recognize company names and common terms
+                generate_kwargs["prompt"] = (
+                    "Amer Alquoz Government Transaction Center, Nexture Corporate Services, "
+                    "Emirates ID, Golden Visa, Green Visa, Dubai, UAE, GDRFA, ICP, Tasheel, "
+                    "Al Barsha, Tecom, Barsha Heights, trade license, visa renewal, attestation"
+                )
 
                 result = self._pipe(
                     audio_path,

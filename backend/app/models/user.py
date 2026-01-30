@@ -1,6 +1,13 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum
 from sqlalchemy.sql import func
+import enum
 from app.database import Base
+
+
+class UserRole(str, enum.Enum):
+    EMPLOYEE = "employee"
+    ADMIN = "admin"
+    SUPERADMIN = "superadmin"
 
 
 class User(Base):
@@ -14,5 +21,7 @@ class User(Base):
     extension = Column(String(20), nullable=True)  # Associated PBX extension
     is_active = Column(Boolean, default=True)
     is_admin = Column(Boolean, default=False)
+    is_superadmin = Column(Boolean, default=False)  # Can see all data and detailed dashboard
+    role = Column(String(20), default=UserRole.EMPLOYEE.value)  # employee, admin, superadmin
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

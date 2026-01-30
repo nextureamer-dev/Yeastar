@@ -65,18 +65,33 @@ def register(
             )
 
     # Create user
+    role = getattr(user_data, 'role', 'employee') or 'employee'
     user = User(
         username=user_data.username,
         email=user_data.email,
         full_name=user_data.full_name,
         extension=user_data.extension,
         hashed_password=get_password_hash(user_data.password),
+        role=role,
     )
 
-    # First user is admin
+    # Set role-based flags
+    if role == "superadmin":
+        user.is_superadmin = True
+        user.is_admin = True
+    elif role == "admin":
+        user.is_admin = True
+        user.is_superadmin = False
+    else:
+        user.is_admin = False
+        user.is_superadmin = False
+
+    # First user is superadmin
     user_count = db.query(User).count()
     if user_count == 0:
         user.is_admin = True
+        user.is_superadmin = True
+        user.role = "superadmin"
 
     db.add(user)
     db.commit()

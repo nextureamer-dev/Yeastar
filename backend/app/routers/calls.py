@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, desc
+from sqlalchemy import or_, desc, and_, func
 from typing import Optional, List
 from datetime import datetime, timedelta
 
@@ -8,9 +8,11 @@ from app.database import get_db
 from app.models.call_log import CallLog, CallDirection, CallStatus
 from app.models.call_summary import CallSummary
 from app.models.contact import Contact
+from app.models.user import User
 from app.schemas.call_log import CallLogCreate, CallLogResponse, CallLogList, ActiveCall
 from app.services.yeastar_client import get_yeastar_client
 from app.services.cdr_sync import get_cdr_sync_service
+from app.services.auth import get_current_user, get_current_user_required, is_superadmin
 
 router = APIRouter(prefix="/calls", tags=["calls"])
 
@@ -87,11 +89,17 @@ async def list_call_logs(
     direction: Optional[str] = Query(None, description="Filter by direction: inbound, outbound, internal"),
     has_summary: Optional[bool] = Query(None, description="Filter by AI summary availability"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_required),
 ):
-    """List call logs directly from Yeastar PBX."""
+    """List call logs directly from Yeastar PBX. Non-superadmin users only see their own calls."""
     client = get_yeastar_client()
 
-    has_filters = bool(search or call_type or status or direction or has_summary is not None)
+    # Check if user needs extension filtering (non-superadmin users)
+    user_extension = None
+    if current_user and not is_superadmin(current_user):
+        user_extension = current_user.extension
+
+    has_filters = bool(search or call_type or status or direction or has_summary is not None or user_extension)
 
     # If filtering by AI summary, get list of call IDs with summaries first
     summary_call_ids = set()
@@ -132,13 +140,15 @@ async def list_call_logs(
         }
 
     # With filters, we need to fetch and filter client-side
-    # We need to fetch ALL matching records to get accurate total and pagination
+    # For employee users, fetch enough data to cover at least 5 days of calls
     all_filtered_logs = []
     current_page = 1
-    max_pages = 200  # Increased limit for larger datasets
+    max_pages = 50 if user_extension else 200  # 50 pages = 5000 records for employees
     fetch_size = 100  # Fetch max per page for efficiency
     total_api_records = 0
     exhausted_api = False
+    # For pagination optimization: stop early once we have enough records
+    target_records = (page * per_page) + per_page  # Get a bit more than needed
 
     # Keep fetching until we've gone through all API pages
     while current_page <= max_pages and not exhausted_api:
@@ -202,6 +212,17 @@ async def list_call_logs(
                 if search_lower not in searchable:
                     continue
 
+            # User extension filter (non-superadmin users only see their own calls)
+            # Uses EXACT match - extension must match exactly, not be a substring
+            if user_extension:
+                caller = cdr.get("call_from_number", "")
+                callee = cdr.get("call_to_number", "")
+                # Check if user's extension is EXACTLY the caller or callee
+                caller_match = caller == user_extension or caller.endswith(f"/{user_extension}") or caller.startswith(f"{user_extension}/")
+                callee_match = callee == user_extension or callee.endswith(f"/{user_extension}") or callee.startswith(f"{user_extension}/")
+                if not caller_match and not callee_match:
+                    continue
+
             # AI Summary filter
             call_uid = cdr.get("uid")
             if has_summary is True and call_uid not in summary_call_ids:
@@ -210,6 +231,11 @@ async def list_call_logs(
                 continue
 
             all_filtered_logs.append(_transform_cdr(cdr))
+
+            # Early termination for employee users once we have enough records
+            if user_extension and len(all_filtered_logs) >= target_records:
+                exhausted_api = True
+                break
 
         current_page += 1
 
@@ -229,31 +255,35 @@ async def list_call_logs(
     }
 
 
-@router.get("/stats")
-async def get_call_stats(
-    days: int = Query(7, ge=1, le=365),
-):
-    """Get call statistics directly from Yeastar PBX."""
+async def _get_call_stats_from_api(days: int, current_user: User):
+    """Fallback: Get call statistics directly from Yeastar API when database is empty."""
     client = get_yeastar_client()
 
-    # Fetch enough records to calculate stats (up to 1000 recent calls)
-    total_calls = 0
+    # Check if user needs extension filtering (non-superadmin users)
+    user_extension = None
+    if current_user and not is_superadmin(current_user):
+        user_extension = current_user.extension
+
+    # Calculate the cutoff date for filtering
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Initialize counters
     inbound_calls = 0
     outbound_calls = 0
+    internal_calls = 0
     answered_calls = 0
     missed_calls = 0
     total_duration = 0
     answered_count_for_avg = 0
 
-    # Get total count first
-    result = await client.get_cdr_list(page=1, page_size=1)
-    if result and result.get("errcode") == 0:
-        total_calls = result.get("total_number", 0)
-
     # Fetch pages to calculate stats
-    pages_to_fetch = min(10, (total_calls // 100) + 1)  # Max 10 pages for stats
+    max_pages = 20
+    found_older_than_cutoff = False
 
-    for page in range(1, pages_to_fetch + 1):
+    for page in range(1, max_pages + 1):
+        if found_older_than_cutoff:
+            break
+
         result = await client.get_cdr_list(
             page=page,
             page_size=100,
@@ -269,13 +299,42 @@ async def get_call_stats(
             break
 
         for cdr in cdrs:
-            call_type = cdr.get("call_type", "").lower()
+            # Parse call time and check if within date range
+            time_str = cdr.get("time", "")
+            call_time = None
+            if time_str:
+                try:
+                    call_time = datetime.strptime(time_str, "%d/%m/%Y %I:%M:%S %p")
+                except ValueError:
+                    try:
+                        call_time = datetime.strptime(time_str, "%d/%m/%Y %H:%M:%S")
+                    except ValueError:
+                        pass
+
+            # Skip if call is older than cutoff date
+            if call_time and call_time < cutoff_date:
+                found_older_than_cutoff = True
+                continue
+
+            cdr_call_type = cdr.get("call_type", "").lower()
+
+            # User extension filter
+            if user_extension:
+                caller = cdr.get("call_from_number", "")
+                callee = cdr.get("call_to_number", "")
+                caller_match = caller == user_extension or caller.endswith(f"/{user_extension}") or caller.startswith(f"{user_extension}/")
+                callee_match = callee == user_extension or callee.endswith(f"/{user_extension}") or callee.startswith(f"{user_extension}/")
+                if not caller_match and not callee_match:
+                    continue
+
             disposition = cdr.get("disposition", "").upper()
 
-            if call_type == "inbound":
+            if cdr_call_type == "inbound":
                 inbound_calls += 1
-            elif call_type == "outbound":
+            elif cdr_call_type == "outbound":
                 outbound_calls += 1
+            elif cdr_call_type == "internal":
+                internal_calls += 1
 
             if disposition == "ANSWERED":
                 answered_calls += 1
@@ -284,18 +343,123 @@ async def get_call_stats(
             elif disposition in ("NO ANSWER", "VOICEMAIL", "BUSY"):
                 missed_calls += 1
 
+    # Calculate totals
     avg_duration = total_duration / answered_count_for_avg if answered_count_for_avg > 0 else 0
-    sample_total = inbound_calls + outbound_calls + (pages_to_fetch * 100 - inbound_calls - outbound_calls)
+    total_calls = inbound_calls + outbound_calls + internal_calls
+    sample_total = total_calls if total_calls > 0 else 1
 
     return {
         "period_days": days,
         "total_calls": total_calls,
         "inbound_calls": inbound_calls,
         "outbound_calls": outbound_calls,
+        "internal_calls": internal_calls,
         "missed_calls": missed_calls,
         "answered_calls": answered_calls,
         "answer_rate": round(answered_calls / sample_total * 100, 1) if sample_total > 0 else 0,
         "average_duration": round(float(avg_duration), 1),
+        "source": "api",  # Indicate this came from API fallback
+    }
+
+
+@router.get("/stats")
+async def get_call_stats(
+    days: int = Query(7, ge=1, le=365),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_required),
+):
+    """Get call statistics from the local database (fast). Non-superadmin users get stats for their calls only."""
+    # Check if database has any records - if not, fall back to API
+    total_db_records = db.query(func.count(CallLog.id)).scalar()
+
+    if total_db_records == 0:
+        # Database is empty, use API-based approach
+        return await _get_call_stats_from_api(days, current_user)
+
+    # Calculate the cutoff date for filtering
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Check if user needs extension filtering (non-superadmin users)
+    user_extension = None
+    if current_user and not is_superadmin(current_user):
+        user_extension = current_user.extension
+
+    # Build base query with date filter
+    base_filter = CallLog.start_time >= cutoff_date
+
+    # Add extension filter for non-superadmin users
+    if user_extension:
+        # User's extension can be caller or callee
+        extension_filter = or_(
+            CallLog.caller_number == user_extension,
+            CallLog.callee_number == user_extension,
+            CallLog.caller_number.like(f"%/{user_extension}"),
+            CallLog.callee_number.like(f"%/{user_extension}"),
+            CallLog.caller_number.like(f"{user_extension}/%"),
+            CallLog.callee_number.like(f"{user_extension}/%"),
+        )
+        base_filter = and_(base_filter, extension_filter)
+
+    # Query stats using efficient SQL aggregation
+    # Count by direction
+    direction_counts = db.query(
+        CallLog.direction,
+        func.count(CallLog.id).label('count')
+    ).filter(base_filter).group_by(CallLog.direction).all()
+
+    # Count by status
+    status_counts = db.query(
+        CallLog.status,
+        func.count(CallLog.id).label('count')
+    ).filter(base_filter).group_by(CallLog.status).all()
+
+    # Get total duration for answered calls
+    duration_result = db.query(
+        func.sum(CallLog.duration).label('total_duration'),
+        func.count(CallLog.id).label('answered_count')
+    ).filter(
+        and_(base_filter, CallLog.status == CallStatus.ANSWERED)
+    ).first()
+
+    # Process direction counts
+    inbound_calls = 0
+    outbound_calls = 0
+    internal_calls = 0
+    for direction, count in direction_counts:
+        if direction == CallDirection.INBOUND:
+            inbound_calls = count
+        elif direction == CallDirection.OUTBOUND:
+            outbound_calls = count
+        elif direction == CallDirection.INTERNAL:
+            internal_calls = count
+
+    # Process status counts
+    answered_calls = 0
+    missed_calls = 0
+    for status, count in status_counts:
+        if status == CallStatus.ANSWERED:
+            answered_calls = count
+        elif status in (CallStatus.NO_ANSWER, CallStatus.MISSED, CallStatus.VOICEMAIL, CallStatus.BUSY):
+            missed_calls += count
+
+    # Calculate totals
+    total_duration = duration_result.total_duration or 0 if duration_result else 0
+    answered_count_for_avg = duration_result.answered_count or 0 if duration_result else 0
+    avg_duration = total_duration / answered_count_for_avg if answered_count_for_avg > 0 else 0
+    total_calls = inbound_calls + outbound_calls + internal_calls
+    sample_total = total_calls if total_calls > 0 else 1
+
+    return {
+        "period_days": days,
+        "total_calls": total_calls,
+        "inbound_calls": inbound_calls,
+        "outbound_calls": outbound_calls,
+        "internal_calls": internal_calls,
+        "missed_calls": missed_calls,
+        "answered_calls": answered_calls,
+        "answer_rate": round(answered_calls / sample_total * 100, 1) if sample_total > 0 else 0,
+        "average_duration": round(float(avg_duration), 1),
+        "source": "database",  # Indicate this came from local database
     }
 
 
@@ -594,6 +758,42 @@ def add_call_notes(
     return {"status": "success"}
 
 
+@router.get("/db-status")
+async def get_database_status(
+    db: Session = Depends(get_db),
+):
+    """Check the status of call logs in the local database (for debugging)."""
+    from sqlalchemy import text
+
+    total_records = db.query(func.count(CallLog.id)).scalar()
+
+    # Get date range of records
+    oldest_record = db.query(func.min(CallLog.start_time)).scalar()
+    newest_record = db.query(func.max(CallLog.start_time)).scalar()
+
+    # Count by direction using raw SQL to avoid enum conversion issues
+    try:
+        result = db.execute(text("SELECT direction, COUNT(*) as cnt FROM call_logs GROUP BY direction"))
+        direction_counts = {str(row[0]): row[1] for row in result.fetchall()}
+    except Exception:
+        direction_counts = {}
+
+    # Count records in last 7 days
+    cutoff_7_days = datetime.now() - timedelta(days=7)
+    records_last_7_days = db.query(func.count(CallLog.id)).filter(
+        CallLog.start_time >= cutoff_7_days
+    ).scalar()
+
+    return {
+        "total_records": total_records,
+        "oldest_record": oldest_record.isoformat() if oldest_record else None,
+        "newest_record": newest_record.isoformat() if newest_record else None,
+        "records_last_7_days": records_last_7_days,
+        "by_direction": direction_counts,
+        "database_ready": total_records > 0,
+    }
+
+
 def _is_success(result: dict) -> bool:
     """Check if PBX API response indicates success (handles both Cloud and on-premise)."""
     if not result:
@@ -703,15 +903,27 @@ async def transfer_call(
 
 @router.post("/sync")
 async def sync_cdr(
-    hours: int = Query(24, ge=1, le=168, description="Number of hours to sync"),
+    hours: int = Query(None, ge=1, le=168, description="Number of hours to sync"),
+    days: int = Query(None, ge=1, le=30, description="Number of days to sync (alternative to hours)"),
+    max_pages: int = Query(20, ge=1, le=100, description="Maximum pages to fetch (100 records per page)"),
 ):
-    """Manually trigger CDR sync from PBX."""
+    """Manually trigger CDR sync from PBX. Syncs call records to local database for fast stats."""
     cdr_service = get_cdr_sync_service()
-    synced = await cdr_service.sync_recent_cdrs(hours=hours)
+
+    # Determine sync period
+    if days:
+        sync_hours = days * 24
+    elif hours:
+        sync_hours = hours
+    else:
+        sync_hours = 24  # Default to 24 hours
+
+    synced = await cdr_service._sync_cloud_cdrs(max_pages=max_pages)
     return {
         "status": "success",
-        "message": f"Synced {synced} CDR records",
+        "message": f"Synced {synced} CDR records to local database",
         "synced_count": synced,
+        "max_pages": max_pages,
     }
 
 

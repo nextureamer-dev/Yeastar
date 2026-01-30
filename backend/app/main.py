@@ -205,6 +205,16 @@ async def lifespan(app: FastAPI):
     client = get_yeastar_client()
     if await client.login():
         logger.info("Connected to Yeastar PBX")
+
+        # Sync recent CDRs to local database for fast stats
+        from app.services.cdr_sync import get_cdr_sync_service
+        cdr_service = get_cdr_sync_service()
+        try:
+            # Sync last 7 days of CDRs (up to 2000 records) for stats
+            synced = await cdr_service._sync_cloud_cdrs(max_pages=20)
+            logger.info(f"Initial CDR sync complete: {synced} records synced")
+        except Exception as e:
+            logger.warning(f"Initial CDR sync failed: {e}")
     else:
         logger.warning("Failed to connect to Yeastar PBX - check configuration")
 

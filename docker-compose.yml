@@ -30,6 +30,7 @@ services:
       - TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
       - HF_HOME=/workspace/huggingface
       - HF_TOKEN=${HF_TOKEN:-}
+      - DB_TYPE=mysql
       - DB_HOST=127.0.0.1
       - DB_PORT=3306
       - DB_NAME=yeastar_crm

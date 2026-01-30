@@ -216,6 +216,8 @@ class CDRSyncService:
             status = CallStatus.BUSY
         elif disposition == "VOICEMAIL":
             status = CallStatus.VOICEMAIL
+        elif disposition in ("FAILED", "CONGESTION"):
+            status = CallStatus.FAILED
         else:
             status = CallStatus.MISSED
 
@@ -227,7 +229,7 @@ class CDRSyncService:
         caller_name = cdr.get("call_from_name", "")
         callee_number = cdr.get("call_to_number", "")
         callee_name = cdr.get("call_to_name", "")
-        recording_file = cdr.get("recording")
+        recording_file = cdr.get("record_file") or cdr.get("recording")
 
         # Lookup contact
         phone_to_lookup = caller_number if direction == CallDirection.INBOUND else callee_number

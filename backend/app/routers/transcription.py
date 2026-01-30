@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_
 from typing import Optional
 from datetime import datetime, timedelta
 import tempfile
@@ -12,8 +12,10 @@ import logging
 
 from app.database import get_db
 from app.models.call_summary import CallSummary
+from app.models.user import User
 from app.services.ai_transcription import get_ai_service
 from app.services.yeastar_client import get_yeastar_client
+from app.services.auth import get_current_user, is_superadmin
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,167 @@ async def list_summaries(
         "total": total,
         "page": page,
         "per_page": per_page,
+    }
+
+
+@router.get("/pending-stats")
+async def get_pending_stats(
+    days: int = Query(7, ge=1, le=365),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get count of calls pending AI summary generation. Falls back to API if database is empty."""
+    from app.models.call_log import CallLog, CallDirection, CallStatus
+
+    # Check if database has any call records
+    total_db_records = db.query(func.count(CallLog.id)).scalar()
+
+    if total_db_records == 0:
+        # Database is empty, use API-based approach
+        return await _get_pending_stats_from_api(days, db, current_user)
+
+    # Calculate cutoff date
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Check if user needs extension filtering
+    user_extension = None
+    if current_user and not is_superadmin(current_user):
+        user_extension = current_user.extension
+
+    # Get set of call IDs that already have summaries (successful ones only)
+    existing_summaries = db.query(CallSummary.call_id).filter(
+        CallSummary.error_message.is_(None)
+    ).all()
+    processed_call_ids = {s.call_id for s in existing_summaries}
+
+    # Build base query for answered calls with recordings in date range
+    base_filter = and_(
+        CallLog.start_time >= cutoff_date,
+        CallLog.status == CallStatus.ANSWERED,
+        CallLog.recording_file.isnot(None),
+        CallLog.recording_file != "",
+    )
+
+    # Add extension filter for non-superadmin users
+    if user_extension:
+        extension_filter = or_(
+            CallLog.caller_number == user_extension,
+            CallLog.callee_number == user_extension,
+            CallLog.caller_number.like(f"%/{user_extension}"),
+            CallLog.callee_number.like(f"%/{user_extension}"),
+            CallLog.caller_number.like(f"{user_extension}/%"),
+            CallLog.callee_number.like(f"{user_extension}/%"),
+        )
+        base_filter = and_(base_filter, extension_filter)
+
+    # Query calls grouped by direction
+    calls = db.query(CallLog.call_id, CallLog.direction).filter(base_filter).all()
+
+    # Count pending calls (those without summaries)
+    inbound_pending = 0
+    outbound_pending = 0
+    internal_pending = 0
+
+    for call_id, direction in calls:
+        if call_id not in processed_call_ids:
+            if direction == CallDirection.INBOUND:
+                inbound_pending += 1
+            elif direction == CallDirection.OUTBOUND:
+                outbound_pending += 1
+            elif direction == CallDirection.INTERNAL:
+                internal_pending += 1
+
+    return {
+        "inbound_pending": inbound_pending,
+        "outbound_pending": outbound_pending,
+        "internal_pending": internal_pending,
+        "total_pending": inbound_pending + outbound_pending + internal_pending,
+        "source": "database",
+    }
+
+
+async def _get_pending_stats_from_api(days: int, db, current_user):
+    """Fallback: Get pending stats from Yeastar API when database is empty."""
+    # Check if user needs extension filtering
+    user_extension = None
+    if current_user and not is_superadmin(current_user):
+        user_extension = current_user.extension
+
+    # Calculate cutoff date
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Get set of call IDs that already have summaries
+    existing_summaries = db.query(CallSummary.call_id).all()
+    processed_call_ids = {s.call_id for s in existing_summaries}
+
+    # Fetch recent CDRs from Yeastar to count pending
+    client = get_yeastar_client()
+    inbound_pending = 0
+    outbound_pending = 0
+    internal_pending = 0
+
+    # Fetch calls within the date range
+    max_pages = 20
+    found_older_than_cutoff = False
+
+    for page in range(1, max_pages + 1):
+        if found_older_than_cutoff:
+            break
+
+        result = await client.get_cdr_list(page=page, page_size=100, sort_by="time", order_by="desc")
+        if not result or result.get("errcode") != 0:
+            break
+        cdrs = result.get("data", [])
+        if not cdrs:
+            break
+
+        for cdr in cdrs:
+            # Parse call time and check if within date range
+            time_str = cdr.get("time", "")
+            call_time = None
+            if time_str:
+                try:
+                    call_time = datetime.strptime(time_str, "%d/%m/%Y %I:%M:%S %p")
+                except ValueError:
+                    try:
+                        call_time = datetime.strptime(time_str, "%d/%m/%Y %H:%M:%S")
+                    except ValueError:
+                        pass
+
+            # Skip if call is older than cutoff date
+            if call_time and call_time < cutoff_date:
+                found_older_than_cutoff = True
+                continue
+
+            call_id = cdr.get("uid")
+            disposition = cdr.get("disposition", "").upper()
+            call_type = cdr.get("call_type", "").lower()
+            recording = cdr.get("record_file") or cdr.get("recording")
+
+            # Filter by user extension if not superadmin
+            if user_extension:
+                caller = cdr.get("call_from_number", "")
+                callee = cdr.get("call_to_number", "")
+                caller_match = caller == user_extension or caller.endswith(f"/{user_extension}") or caller.startswith(f"{user_extension}/")
+                callee_match = callee == user_extension or callee.endswith(f"/{user_extension}") or callee.startswith(f"{user_extension}/")
+                if not caller_match and not callee_match:
+                    continue
+
+            # Only count answered calls with recordings that haven't been processed
+            if disposition == "ANSWERED" and recording and call_id not in processed_call_ids:
+                if call_type == "inbound":
+                    inbound_pending += 1
+                elif call_type == "outbound":
+                    outbound_pending += 1
+                elif call_type == "internal":
+                    internal_pending += 1
+
+    return {
+        "inbound_pending": inbound_pending,
+        "outbound_pending": outbound_pending,
+        "internal_pending": internal_pending,
+        "total_pending": inbound_pending + outbound_pending + internal_pending,
+        "source": "api",
     }
 
 
@@ -507,6 +670,330 @@ async def get_deep_analytics(
             "by_status": dict(resolution_counts),
             "resolution_rate": resolution_rate
         }
+    }
+
+
+@router.get("/staff-analytics")
+async def get_staff_analytics(
+    days: int = Query(30, ge=1, le=365, description="Number of days to analyze"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get comprehensive staff performance analytics.
+
+    Returns detailed metrics for each staff member including:
+    - Call volume and distribution
+    - Performance scores (professionalism, knowledge, communication, empathy)
+    - Resolution rates and sentiment analysis
+    - Sales metrics (opportunities, conversion rates)
+    - Department-level aggregations
+    """
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get all successful summaries with staff info
+    summaries = db.query(CallSummary).filter(
+        CallSummary.created_at >= cutoff_date,
+        CallSummary.error_message.is_(None),
+    ).all()
+
+    # Staff extension mapping for reference
+    staff_directory = {
+        "201": {"name": "Jijina", "department": "Call Centre", "role": "Call Centre Agent"},
+        "202": {"name": "Joanna", "department": "Call Centre", "role": "Call Centre Agent"},
+        "203": {"name": "Ramshad", "department": "Call Centre", "role": "Call Centre Agent"},
+        "207": {"name": "Saumil", "department": "Sales", "role": "Sales Agent"},
+        "208": {"name": "Pranay", "department": "Sales", "role": "Sales Agent"},
+        "209": {"name": "Sai", "department": "Sales", "role": "Sales Agent"},
+    }
+
+    # Initialize staff stats
+    staff_stats = {}
+    department_stats = {"Call Centre": {}, "Sales": {}, "Unknown": {}}
+
+    for s in summaries:
+        # Determine staff key (extension or name)
+        staff_key = s.staff_extension or s.staff_name or "Unknown"
+
+        # Get staff info from directory or summary
+        if s.staff_extension and s.staff_extension in staff_directory:
+            staff_info = staff_directory[s.staff_extension]
+            staff_name = staff_info["name"]
+            department = staff_info["department"]
+        else:
+            staff_name = s.staff_name or "Unknown"
+            department = s.staff_department or "Unknown"
+
+        # Initialize staff entry if needed
+        if staff_key not in staff_stats:
+            staff_stats[staff_key] = {
+                "extension": s.staff_extension,
+                "name": staff_name,
+                "department": department,
+                "total_calls": 0,
+                "sentiments": {"positive": 0, "neutral": 0, "negative": 0, "mixed": 0},
+                "resolutions": {"resolved": 0, "pending": 0, "escalated": 0, "other": 0},
+                "call_types": {},
+                "service_categories": {},
+                "performance_scores": [],
+                "professionalism_scores": [],
+                "knowledge_scores": [],
+                "communication_scores": [],
+                "empathy_scores": [],
+                "sales_opportunities": 0,
+                "hot_leads": 0,
+                "warm_leads": 0,
+                "cold_leads": 0,
+                "estimated_pipeline_value": 0,
+                "first_call_resolutions": 0,
+                "follow_ups_required": 0,
+                "customer_types": {},
+            }
+
+        stats = staff_stats[staff_key]
+        stats["total_calls"] += 1
+
+        # Sentiment
+        if s.sentiment:
+            sent_key = s.sentiment.lower()
+            if sent_key in stats["sentiments"]:
+                stats["sentiments"][sent_key] += 1
+
+        # Resolution status
+        if s.resolution_status:
+            res_key = s.resolution_status.lower()
+            if res_key in ["resolved", "completed"]:
+                stats["resolutions"]["resolved"] += 1
+            elif res_key in ["pending", "requires_followup"]:
+                stats["resolutions"]["pending"] += 1
+            elif res_key == "escalated":
+                stats["resolutions"]["escalated"] += 1
+            else:
+                stats["resolutions"]["other"] += 1
+
+        # Call types
+        if s.call_type:
+            stats["call_types"][s.call_type] = stats["call_types"].get(s.call_type, 0) + 1
+
+        # Service categories
+        if s.service_category:
+            stats["service_categories"][s.service_category] = stats["service_categories"].get(s.service_category, 0) + 1
+
+        # Performance scores
+        if s.overall_performance_score:
+            stats["performance_scores"].append(s.overall_performance_score)
+        if s.professionalism_score:
+            stats["professionalism_scores"].append(s.professionalism_score)
+        if s.knowledge_score:
+            stats["knowledge_scores"].append(s.knowledge_score)
+        if s.communication_score:
+            stats["communication_scores"].append(s.communication_score)
+        if s.empathy_score:
+            stats["empathy_scores"].append(s.empathy_score)
+
+        # Sales metrics
+        if s.is_sales_opportunity:
+            stats["sales_opportunities"] += 1
+        if s.lead_quality == "hot":
+            stats["hot_leads"] += 1
+        elif s.lead_quality == "warm":
+            stats["warm_leads"] += 1
+        elif s.lead_quality == "cold":
+            stats["cold_leads"] += 1
+        if s.estimated_deal_value:
+            stats["estimated_pipeline_value"] += s.estimated_deal_value
+
+        # Quality metrics
+        if s.first_call_resolution:
+            stats["first_call_resolutions"] += 1
+        if s.follow_up_required:
+            stats["follow_ups_required"] += 1
+
+        # Customer types
+        if s.customer_type:
+            stats["customer_types"][s.customer_type] = stats["customer_types"].get(s.customer_type, 0) + 1
+
+    # Process and calculate averages for each staff member
+    staff_performance = []
+    for key, stats in staff_stats.items():
+        if stats["name"] == "Unknown" and stats["total_calls"] < 5:
+            continue  # Skip unknown with few calls
+
+        # Calculate averages
+        avg_performance = sum(stats["performance_scores"]) / len(stats["performance_scores"]) if stats["performance_scores"] else None
+        avg_professionalism = sum(stats["professionalism_scores"]) / len(stats["professionalism_scores"]) if stats["professionalism_scores"] else None
+        avg_knowledge = sum(stats["knowledge_scores"]) / len(stats["knowledge_scores"]) if stats["knowledge_scores"] else None
+        avg_communication = sum(stats["communication_scores"]) / len(stats["communication_scores"]) if stats["communication_scores"] else None
+        avg_empathy = sum(stats["empathy_scores"]) / len(stats["empathy_scores"]) if stats["empathy_scores"] else None
+
+        # Calculate rates
+        resolution_rate = (stats["resolutions"]["resolved"] / stats["total_calls"] * 100) if stats["total_calls"] > 0 else 0
+        positive_rate = (stats["sentiments"]["positive"] / stats["total_calls"] * 100) if stats["total_calls"] > 0 else 0
+        fcr_rate = (stats["first_call_resolutions"] / stats["total_calls"] * 100) if stats["total_calls"] > 0 else 0
+
+        staff_performance.append({
+            "extension": stats["extension"],
+            "name": stats["name"],
+            "department": stats["department"],
+            "total_calls": stats["total_calls"],
+            "sentiment_breakdown": stats["sentiments"],
+            "resolution_breakdown": stats["resolutions"],
+            "resolution_rate": round(resolution_rate, 1),
+            "positive_sentiment_rate": round(positive_rate, 1),
+            "first_call_resolution_rate": round(fcr_rate, 1),
+            "avg_performance_score": round(avg_performance, 1) if avg_performance else None,
+            "avg_professionalism_score": round(avg_professionalism, 1) if avg_professionalism else None,
+            "avg_knowledge_score": round(avg_knowledge, 1) if avg_knowledge else None,
+            "avg_communication_score": round(avg_communication, 1) if avg_communication else None,
+            "avg_empathy_score": round(avg_empathy, 1) if avg_empathy else None,
+            "sales_opportunities": stats["sales_opportunities"],
+            "hot_leads": stats["hot_leads"],
+            "warm_leads": stats["warm_leads"],
+            "cold_leads": stats["cold_leads"],
+            "estimated_pipeline_value": stats["estimated_pipeline_value"],
+            "follow_ups_required": stats["follow_ups_required"],
+            "top_call_types": sorted(stats["call_types"].items(), key=lambda x: x[1], reverse=True)[:5],
+            "service_category_breakdown": stats["service_categories"],
+            "customer_type_breakdown": stats["customer_types"],
+        })
+
+    # Sort by total calls
+    staff_performance = sorted(staff_performance, key=lambda x: x["total_calls"], reverse=True)
+
+    # Calculate department aggregates
+    dept_aggregates = {}
+    for staff in staff_performance:
+        dept = staff["department"]
+        if dept not in dept_aggregates:
+            dept_aggregates[dept] = {
+                "department": dept,
+                "total_staff": 0,
+                "total_calls": 0,
+                "total_resolved": 0,
+                "total_positive": 0,
+                "performance_scores": [],
+                "sales_opportunities": 0,
+                "pipeline_value": 0,
+            }
+
+        agg = dept_aggregates[dept]
+        agg["total_staff"] += 1
+        agg["total_calls"] += staff["total_calls"]
+        agg["total_resolved"] += staff["resolution_breakdown"]["resolved"]
+        agg["total_positive"] += staff["sentiment_breakdown"]["positive"]
+        if staff["avg_performance_score"]:
+            agg["performance_scores"].append(staff["avg_performance_score"])
+        agg["sales_opportunities"] += staff["sales_opportunities"]
+        agg["pipeline_value"] += staff["estimated_pipeline_value"]
+
+    # Finalize department stats
+    department_summary = []
+    for dept, agg in dept_aggregates.items():
+        department_summary.append({
+            "department": dept,
+            "total_staff": agg["total_staff"],
+            "total_calls": agg["total_calls"],
+            "resolution_rate": round((agg["total_resolved"] / agg["total_calls"] * 100) if agg["total_calls"] > 0 else 0, 1),
+            "positive_sentiment_rate": round((agg["total_positive"] / agg["total_calls"] * 100) if agg["total_calls"] > 0 else 0, 1),
+            "avg_performance_score": round(sum(agg["performance_scores"]) / len(agg["performance_scores"]), 1) if agg["performance_scores"] else None,
+            "sales_opportunities": agg["sales_opportunities"],
+            "pipeline_value": agg["pipeline_value"],
+        })
+
+    # Get top performers
+    top_by_calls = sorted(staff_performance, key=lambda x: x["total_calls"], reverse=True)[:5]
+    top_by_performance = sorted([s for s in staff_performance if s["avg_performance_score"]], key=lambda x: x["avg_performance_score"], reverse=True)[:5]
+    top_by_resolution = sorted([s for s in staff_performance if s["total_calls"] >= 5], key=lambda x: x["resolution_rate"], reverse=True)[:5]
+    top_by_sales = sorted(staff_performance, key=lambda x: x["sales_opportunities"], reverse=True)[:5]
+
+    return {
+        "period_days": days,
+        "total_calls_analyzed": len(summaries),
+        "staff_directory": staff_directory,
+        "staff_performance": staff_performance,
+        "department_summary": department_summary,
+        "leaderboards": {
+            "by_call_volume": [{"name": s["name"], "extension": s["extension"], "calls": s["total_calls"]} for s in top_by_calls],
+            "by_performance_score": [{"name": s["name"], "extension": s["extension"], "score": s["avg_performance_score"]} for s in top_by_performance],
+            "by_resolution_rate": [{"name": s["name"], "extension": s["extension"], "rate": s["resolution_rate"]} for s in top_by_resolution],
+            "by_sales_opportunities": [{"name": s["name"], "extension": s["extension"], "opportunities": s["sales_opportunities"]} for s in top_by_sales],
+        },
+    }
+
+
+@router.get("/sales-pipeline")
+async def get_sales_pipeline(
+    days: int = Query(30, ge=1, le=365, description="Number of days to analyze"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get sales pipeline analytics from call summaries.
+
+    Returns leads, opportunities, and potential revenue from calls.
+    """
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get calls marked as sales opportunities
+    opportunities = db.query(CallSummary).filter(
+        CallSummary.created_at >= cutoff_date,
+        CallSummary.error_message.is_(None),
+        CallSummary.is_sales_opportunity == True,
+    ).order_by(CallSummary.created_at.desc()).all()
+
+    # Aggregate by lead quality
+    pipeline = {
+        "hot": {"count": 0, "value": 0, "calls": []},
+        "warm": {"count": 0, "value": 0, "calls": []},
+        "cold": {"count": 0, "value": 0, "calls": []},
+        "unqualified": {"count": 0, "value": 0, "calls": []},
+    }
+
+    for opp in opportunities:
+        quality = opp.lead_quality or "unqualified"
+        if quality not in pipeline:
+            quality = "unqualified"
+
+        pipeline[quality]["count"] += 1
+        pipeline[quality]["value"] += opp.estimated_deal_value or 0
+        pipeline[quality]["calls"].append({
+            "call_id": opp.call_id,
+            "customer_name": opp.customer_name,
+            "company_name": opp.company_name,
+            "service_category": opp.service_category,
+            "estimated_value": opp.estimated_deal_value,
+            "urgency": opp.urgency_level,
+            "follow_up_required": opp.follow_up_required,
+            "follow_up_date": opp.follow_up_date.isoformat() if opp.follow_up_date else None,
+            "staff_name": opp.staff_name,
+            "created_at": opp.created_at.isoformat() if opp.created_at else None,
+        })
+
+    # Get follow-ups due
+    follow_ups = db.query(CallSummary).filter(
+        CallSummary.follow_up_required == True,
+        CallSummary.follow_up_date.isnot(None),
+        CallSummary.follow_up_date >= datetime.utcnow(),
+    ).order_by(CallSummary.follow_up_date).limit(20).all()
+
+    return {
+        "period_days": days,
+        "total_opportunities": len(opportunities),
+        "total_pipeline_value": sum(p["value"] for p in pipeline.values()),
+        "by_lead_quality": {
+            k: {"count": v["count"], "value": v["value"]}
+            for k, v in pipeline.items()
+        },
+        "hot_leads": pipeline["hot"]["calls"][:10],
+        "warm_leads": pipeline["warm"]["calls"][:10],
+        "upcoming_follow_ups": [
+            {
+                "call_id": f.call_id,
+                "customer_name": f.customer_name,
+                "company_name": f.company_name,
+                "follow_up_date": f.follow_up_date.isoformat() if f.follow_up_date else None,
+                "staff_name": f.staff_name,
+            }
+            for f in follow_ups
+        ],
     }
 
 
@@ -950,6 +1437,63 @@ def _parse_cloud_time(time_str: str) -> Optional[datetime]:
     return None
 
 
+def _parse_score(value) -> Optional[int]:
+    """Parse a score value (1-10) from various formats."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return max(1, min(10, value))
+    if isinstance(value, float):
+        return max(1, min(10, int(value)))
+    if isinstance(value, str):
+        # Handle "8/10", "8 out of 10", "8", etc.
+        import re
+        match = re.search(r'(\d+)', str(value))
+        if match:
+            return max(1, min(10, int(match.group(1))))
+    return None
+
+
+def _parse_amount(value) -> Optional[float]:
+    """Parse an amount value from various formats."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        import re
+        # Remove currency symbols and commas
+        cleaned = re.sub(r'[^\d.]', '', str(value))
+        if cleaned:
+            try:
+                return float(cleaned)
+            except ValueError:
+                pass
+    return None
+
+
+def _parse_date(value) -> Optional[datetime]:
+    """Parse a date value from various formats."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        formats = [
+            "%Y-%m-%d",
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+    return None
+
+
 async def _process_recording_task(
     call_id: str,
     recording_file: Optional[str] = None,
@@ -1012,11 +1556,11 @@ async def _process_recording_task(
         try:
             # Process with AI
             ai_service = get_ai_service()
-            result = await ai_service.process_recording(temp_path)
+            result = await ai_service.process_recording(temp_path, recording_file=recording_file)
 
             # Save to database
             if result.get("success"):
-                summary_data = result.get("summary", {})
+                summary_data = result.get("summary", {}) or {}
 
                 # Check if exists (for force update)
                 existing = db.query(CallSummary).filter(CallSummary.call_id == call_id).first()
@@ -1027,6 +1571,38 @@ async def _process_recording_task(
                 if mood_analysis and isinstance(mood_analysis, dict):
                     sentiment = mood_analysis.get("overall_sentiment", sentiment)
 
+                # Extract performance scores from employee_performance
+                emp_perf = summary_data.get("employee_performance", {}) or {}
+                professionalism_score = _parse_score(emp_perf.get("professionalism_score"))
+                knowledge_score = _parse_score(emp_perf.get("knowledge_score"))
+                communication_score = _parse_score(emp_perf.get("communication_score"))
+                empathy_score = _parse_score(emp_perf.get("empathy_score"))
+                overall_performance_score = _parse_score(emp_perf.get("overall_performance_score"))
+
+                # Extract call classification data
+                call_class = summary_data.get("call_classification", {}) or {}
+                is_sales_opportunity = call_class.get("is_sales_opportunity", False)
+                lead_quality = call_class.get("lead_quality")
+                estimated_deal_value = _parse_amount(call_class.get("estimated_deal_value"))
+                conversion_likelihood = call_class.get("conversion_likelihood")
+                urgency_level = call_class.get("urgency_level")
+                follow_up_required = call_class.get("follow_up_required", False)
+                follow_up_date = _parse_date(call_class.get("follow_up_date"))
+
+                # Extract customer profile data
+                cust_profile = summary_data.get("customer_profile", {}) or {}
+                customer_type = cust_profile.get("customer_type")
+
+                # Extract call quality metrics
+                quality_metrics = summary_data.get("call_quality_metrics", {}) or {}
+                first_call_resolution = quality_metrics.get("first_call_resolution")
+                customer_effort_score = quality_metrics.get("customer_effort_score")
+
+                # Get staff info from result (extracted from filename) or summary
+                staff_extension = result.get("staff_extension") or summary_data.get("staff_extension")
+                staff_name = result.get("staff_name") or summary_data.get("staff_name")
+                staff_department = result.get("staff_department") or summary_data.get("staff_department")
+
                 if existing:
                     # Update existing
                     existing.recording_file = recording_file
@@ -1034,20 +1610,46 @@ async def _process_recording_task(
                     existing.transcript_preview = result.get("transcript_preview")
                     existing.call_type = summary_data.get("call_type")
                     existing.service_category = summary_data.get("service_category")
+                    existing.service_subcategory = summary_data.get("service_subcategory")
                     existing.summary = summary_data.get("summary")
-                    existing.staff_name = summary_data.get("staff_name")
+                    existing.staff_name = staff_name
+                    existing.staff_extension = staff_extension
+                    existing.staff_department = staff_department
+                    existing.staff_role = summary_data.get("staff_role")
                     existing.customer_name = summary_data.get("customer_name")
+                    existing.customer_phone = summary_data.get("customer_phone")
                     existing.company_name = summary_data.get("company_name")
                     existing.topics_discussed = summary_data.get("topics_discussed")
                     existing.customer_requests = summary_data.get("customer_requests")
                     existing.staff_responses = summary_data.get("staff_responses")
                     existing.action_items = summary_data.get("action_items")
+                    existing.commitments_made = summary_data.get("commitments_made")
                     existing.resolution_status = summary_data.get("resolution_status")
                     existing.sentiment = sentiment
                     existing.key_details = summary_data.get("key_details")
+                    existing.call_classification = call_class
+                    existing.is_sales_opportunity = is_sales_opportunity
+                    existing.lead_quality = lead_quality
+                    existing.estimated_deal_value = estimated_deal_value
+                    existing.conversion_likelihood = conversion_likelihood
+                    existing.urgency_level = urgency_level
+                    existing.follow_up_required = follow_up_required
+                    existing.follow_up_date = follow_up_date
+                    existing.customer_profile = cust_profile
+                    existing.customer_type = customer_type
                     existing.mood_sentiment_analysis = mood_analysis
-                    existing.employee_performance = summary_data.get("employee_performance")
+                    existing.employee_performance = emp_perf
+                    existing.professionalism_score = professionalism_score
+                    existing.knowledge_score = knowledge_score
+                    existing.communication_score = communication_score
+                    existing.empathy_score = empathy_score
+                    existing.overall_performance_score = overall_performance_score
+                    existing.compliance_check = summary_data.get("compliance_check")
+                    existing.call_quality_metrics = quality_metrics
+                    existing.first_call_resolution = first_call_resolution
+                    existing.customer_effort_score = customer_effort_score
                     existing.processing_time_seconds = result.get("processing_time_seconds")
+                    existing.model_used = result.get("model_used")
                     existing.error_message = None
                 else:
                     # Create new
@@ -1058,20 +1660,46 @@ async def _process_recording_task(
                         transcript_preview=result.get("transcript_preview"),
                         call_type=summary_data.get("call_type"),
                         service_category=summary_data.get("service_category"),
+                        service_subcategory=summary_data.get("service_subcategory"),
                         summary=summary_data.get("summary"),
-                        staff_name=summary_data.get("staff_name"),
+                        staff_name=staff_name,
+                        staff_extension=staff_extension,
+                        staff_department=staff_department,
+                        staff_role=summary_data.get("staff_role"),
                         customer_name=summary_data.get("customer_name"),
+                        customer_phone=summary_data.get("customer_phone"),
                         company_name=summary_data.get("company_name"),
                         topics_discussed=summary_data.get("topics_discussed"),
                         customer_requests=summary_data.get("customer_requests"),
                         staff_responses=summary_data.get("staff_responses"),
                         action_items=summary_data.get("action_items"),
+                        commitments_made=summary_data.get("commitments_made"),
                         resolution_status=summary_data.get("resolution_status"),
                         sentiment=sentiment,
                         key_details=summary_data.get("key_details"),
+                        call_classification=call_class,
+                        is_sales_opportunity=is_sales_opportunity,
+                        lead_quality=lead_quality,
+                        estimated_deal_value=estimated_deal_value,
+                        conversion_likelihood=conversion_likelihood,
+                        urgency_level=urgency_level,
+                        follow_up_required=follow_up_required,
+                        follow_up_date=follow_up_date,
+                        customer_profile=cust_profile,
+                        customer_type=customer_type,
                         mood_sentiment_analysis=mood_analysis,
-                        employee_performance=summary_data.get("employee_performance"),
+                        employee_performance=emp_perf,
+                        professionalism_score=professionalism_score,
+                        knowledge_score=knowledge_score,
+                        communication_score=communication_score,
+                        empathy_score=empathy_score,
+                        overall_performance_score=overall_performance_score,
+                        compliance_check=summary_data.get("compliance_check"),
+                        call_quality_metrics=quality_metrics,
+                        first_call_resolution=first_call_resolution,
+                        customer_effort_score=customer_effort_score,
                         processing_time_seconds=result.get("processing_time_seconds"),
+                        model_used=result.get("model_used"),
                     )
                     db.add(summary)
 

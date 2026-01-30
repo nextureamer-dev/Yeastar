@@ -93,10 +93,13 @@ CREATE TABLE IF NOT EXISTS users (
     extension VARCHAR(20),
     is_active BOOLEAN DEFAULT TRUE,
     is_admin BOOLEAN DEFAULT FALSE,
+    is_superadmin BOOLEAN DEFAULT FALSE,
+    role VARCHAR(20) DEFAULT 'employee',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_username (username),
-    INDEX idx_email (email)
+    INDEX idx_email (email),
+    INDEX idx_extension (extension)
 ) ENGINE=InnoDB;
 
 -- Insert sample data (optional)

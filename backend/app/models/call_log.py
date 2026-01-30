@@ -33,15 +33,15 @@ class CallLog(Base):
     caller_name = Column(String(200), nullable=True)
     callee_name = Column(String(200), nullable=True)
 
-    direction = Column(Enum(CallDirection), nullable=False)
-    status = Column(Enum(CallStatus), nullable=False)
+    direction = Column(Enum(CallDirection, values_callable=lambda x: [e.value for e in x]), nullable=False)
+    status = Column(Enum(CallStatus, values_callable=lambda x: [e.value for e in x]), nullable=False)
 
     # Extension info
     extension = Column(String(20), nullable=True)
     trunk = Column(String(100), nullable=True)
 
     # Timing
-    start_time = Column(DateTime(timezone=True), nullable=False)
+    start_time = Column(DateTime(timezone=True), nullable=False, index=True)
     answer_time = Column(DateTime(timezone=True), nullable=True)
     end_time = Column(DateTime(timezone=True), nullable=True)
     duration = Column(Integer, default=0)  # Duration in seconds
