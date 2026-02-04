@@ -83,6 +83,12 @@ class CallSummary(Base):
     client_requirements = Column(JSON, nullable=True)
     caller_requests = Column(JSON, nullable=True)
 
+    # Feedback fields
+    feedback_rating = Column(Integer, nullable=True)  # 1=dislike, 2=like
+    feedback_by = Column(String(100), nullable=True)  # username who gave feedback
+    feedback_at = Column(DateTime(timezone=True), nullable=True)
+    feedback_comment = Column(Text, nullable=True)  # optional comment with feedback
+
     # Processing info
     processing_time_seconds = Column(Integer, nullable=True)
     model_used = Column(String(50), nullable=True)
@@ -164,10 +170,40 @@ class CallSummary(Base):
             "first_call_resolution": self.first_call_resolution,
             "customer_effort_score": self.customer_effort_score,
 
+            # Feedback
+            "feedback_rating": self.feedback_rating,
+            "feedback_by": self.feedback_by,
+            "feedback_at": self.feedback_at.isoformat() if self.feedback_at else None,
+            "feedback_comment": self.feedback_comment,
+
             # Processing info
             "processing_time_seconds": self.processing_time_seconds,
             "model_used": self.model_used,
             "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class SummaryNote(Base):
+    """Model for user notes on AI summaries."""
+
+    __tablename__ = "summary_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    call_id = Column(String(100), ForeignKey('call_summaries.call_id'), index=True, nullable=False)
+    content = Column(Text, nullable=False)
+    created_by = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        """Convert to dictionary."""
+        return {
+            "id": self.id,
+            "call_id": self.call_id,
+            "content": self.content,
+            "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

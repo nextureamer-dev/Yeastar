@@ -392,8 +392,9 @@ class WhisperEngine:
                     self._device = "cpu"
                     logger.info("Using CPU (no GPU available)")
 
-                # Use whisper-large-v3-turbo for fast inference
-                model_id = "openai/whisper-large-v3-turbo"
+                # Use whisper-large-v3 for better multilingual accuracy (Hindi, Malayalam, Arabic)
+                # Note: large-v3 is slower but more accurate than turbo variant for non-English
+                model_id = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3")
                 torch_dtype = torch.float16 if "cuda" in self._device else torch.float32
 
                 logger.info(f"Loading Whisper model: {model_id} on {self._device}")
@@ -402,9 +403,24 @@ class WhisperEngine:
                 loop = asyncio.get_event_loop()
 
                 def _load():
+                    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+                    # Load model with better settings for multilingual
+                    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                        model_id,
+                        torch_dtype=torch_dtype,
+                        low_cpu_mem_usage=True,
+                        use_safetensors=True,
+                    )
+                    model.to(self._device)
+
+                    processor = AutoProcessor.from_pretrained(model_id)
+
                     return pipeline(
                         "automatic-speech-recognition",
-                        model=model_id,
+                        model=model,
+                        tokenizer=processor.tokenizer,
+                        feature_extractor=processor.feature_extractor,
                         torch_dtype=torch_dtype,
                         device=self._device,
                     )
@@ -554,21 +570,41 @@ class WhisperEngine:
             loop = asyncio.get_event_loop()
 
             def _do_transcribe():
-                generate_kwargs = {}
-                if language:
-                    generate_kwargs["language"] = language
+                # Enhanced generation kwargs for better multilingual accuracy
+                generate_kwargs = {
+                    # Improve accuracy with beam search
+                    "num_beams": 5,
+                    # Temperature for more deterministic output
+                    "temperature": 0.0,
+                    # Compression ratio threshold to filter hallucinations
+                    "compression_ratio_threshold": 2.4,
+                    # Log probability threshold
+                    "logprob_threshold": -1.0,
+                    # No speech threshold - filter silence/noise
+                    "no_speech_threshold": 0.6,
+                }
 
-                # Add prompt to help recognize company names and common terms
-                generate_kwargs["prompt"] = (
-                    "Amer Alquoz Government Transaction Center, Nexture Corporate Services, "
-                    "Emirates ID, Golden Visa, Green Visa, Dubai, UAE, GDRFA, ICP, Tasheel, "
-                    "Al Barsha, Tecom, Barsha Heights, trade license, visa renewal, attestation"
+                if language:
+                    # If language is specified, use it
+                    generate_kwargs["language"] = language
+                else:
+                    # Don't force English - let model detect language
+                    # This is crucial for Hindi, Malayalam, Arabic calls
+                    generate_kwargs["task"] = "transcribe"
+
+                # Domain-specific prompt for better context (Whisper supports initial_prompt)
+                # This helps with business-specific vocabulary
+                domain_prompt = (
+                    "This is a phone call at a government service center in Dubai, UAE. "
+                    "Common terms: Emirates ID, visa, Golden Visa, residence permit, "
+                    "attestation, trade license, company formation, PRO services, "
+                    "Amer Centre, Nexture, GDRFA, ICP, medical fitness, typing services."
                 )
 
                 result = self._pipe(
                     audio_path,
                     chunk_length_s=30,
-                    batch_size=24,  # Increase for GPU
+                    batch_size=16,  # Reduced for better accuracy
                     return_timestamps=True,
                     generate_kwargs=generate_kwargs,
                 )
@@ -583,10 +619,54 @@ class WhisperEngine:
                             "text": chunk.get("text", "").strip()
                         })
 
+                # Detect language from transcript text
+                detected_language = "unknown"
+                language_confidence = 0.0
+                all_detected_langs = []
+                transcript_text = result.get("text", "").strip()
+
+                # Map common language codes to full names
+                lang_map = {
+                    'en': 'English', 'hi': 'Hindi', 'ar': 'Arabic',
+                    'ml': 'Malayalam', 'ta': 'Tamil', 'te': 'Telugu',
+                    'ur': 'Urdu', 'bn': 'Bengali', 'gu': 'Gujarati',
+                    'mr': 'Marathi', 'pa': 'Punjabi', 'kn': 'Kannada',
+                    'fr': 'French', 'de': 'German', 'es': 'Spanish',
+                    'pt': 'Portuguese', 'ru': 'Russian', 'zh-cn': 'Chinese',
+                    'ja': 'Japanese', 'ko': 'Korean', 'fa': 'Persian',
+                }
+
+                if transcript_text and len(transcript_text) > 20:
+                    try:
+                        from langdetect import detect_langs
+                        langs = detect_langs(transcript_text)
+                        if langs:
+                            # Get primary language
+                            primary_lang = langs[0].lang
+                            language_confidence = langs[0].prob
+
+                            # Check for mixed language (code-switching common in UAE)
+                            # If multiple languages detected with significant probability
+                            significant_langs = [l for l in langs if l.prob > 0.15]
+                            if len(significant_langs) > 1:
+                                # Mixed language call
+                                lang_names = [lang_map.get(l.lang, l.lang.upper()) for l in significant_langs[:2]]
+                                detected_language = f"{lang_names[0]}/{lang_names[1]}"
+                                all_detected_langs = [(lang_map.get(l.lang, l.lang.upper()), round(l.prob, 2)) for l in langs[:3]]
+                            else:
+                                detected_language = lang_map.get(primary_lang, primary_lang.upper())
+                                all_detected_langs = [(detected_language, round(language_confidence, 2))]
+
+                    except Exception as e:
+                        logger.warning(f"Language detection failed: {e}")
+
                 return {
-                    "raw_transcript": result.get("text", "").strip(),
+                    "raw_transcript": transcript_text,
                     "segments": segment_list,
                     "duration": segment_list[-1]["end"] if segment_list else 0,
+                    "detected_language": detected_language,
+                    "language_confidence": language_confidence,
+                    "all_detected_languages": all_detected_langs,
                 }
 
             whisper_result = await loop.run_in_executor(None, _do_transcribe)
@@ -621,8 +701,8 @@ class WhisperEngine:
                 "success": True,
                 "transcript": transcript,
                 "raw_transcript": whisper_result["raw_transcript"],
-                "language": language or "auto",
-                "language_probability": 1.0,
+                "language": language or whisper_result.get("detected_language", "unknown"),
+                "language_probability": whisper_result.get("language_confidence", 0.0),
                 "segments": segments,
                 "duration": whisper_result["duration"],
                 "has_speaker_diarization": has_diarization,

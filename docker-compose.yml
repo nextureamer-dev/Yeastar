@@ -43,6 +43,9 @@ services:
       - YEASTAR_PASSWORD=P@ssw0rd123
       - YEASTAR_CLIENT_ID=B8wFfDNwuu2CguKV1HCehwwgsMVsrWeG
       - YEASTAR_CLIENT_SECRET=EoOKDu8qNGLljq4sfscE8096Zv5tYH6X
+      # Whisper model: use "openai/whisper-large-v3" for best multilingual accuracy
+      # or "openai/whisper-large-v3-turbo" for faster but less accurate transcription
+      - WHISPER_MODEL=openai/whisper-large-v3
     volumes:
       - ./backend:/workspace/backend
       - ./ai_models:/workspace/models
@@ -50,7 +53,7 @@ services:
     working_dir: /workspace
     command: >
       bash -c "apt-get update && apt-get install -y ffmpeg libsndfile1 &&
-      pip install faster-whisper httpx fastapi uvicorn sqlalchemy pymysql cryptography pydantic-settings python-jose passlib bcrypt websockets aiofiles transformers accelerate python-multipart &&
+      pip install faster-whisper httpx fastapi uvicorn sqlalchemy pymysql cryptography pydantic-settings python-jose passlib bcrypt websockets aiofiles transformers accelerate python-multipart langdetect &&
       cd /workspace/backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
     deploy:
       resources:
