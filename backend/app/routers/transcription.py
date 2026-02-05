@@ -1882,6 +1882,67 @@ async def _process_recording_task(
                 staff_name = result.get("staff_name") or summary_data.get("staff_name")
                 staff_department = result.get("staff_department") or summary_data.get("staff_department")
 
+                # ==================== EXTRACT DEPARTMENT-SPECIFIC ANALYSIS ====================
+                dept_analysis = summary_data.get("department_analysis", {}) or {}
+                cross_dept = summary_data.get("cross_department", {}) or {}
+
+                # Star Rating (Universal)
+                star_rating = _parse_score(dept_analysis.get("star_rating"))
+                star_rating_justification = dept_analysis.get("star_rating_justification")
+
+                # Qualifier Department Fields
+                qualifier_analysis = dept_analysis.get("qualifier_analysis", {}) or {}
+                qualifier_requirement_type = qualifier_analysis.get("requirement_type")
+                qualifier_timeline = qualifier_analysis.get("timeline")
+                qualifier_decision_maker_status = qualifier_analysis.get("decision_maker_status")
+                qualifier_appointment_offered = qualifier_analysis.get("appointment_offered")
+                qualifier_fail_reason = qualifier_analysis.get("fail_reason")
+                qualifier_service_name = qualifier_analysis.get("service_name")
+                qualifier_short_description = qualifier_analysis.get("short_description")
+                qualifier_expected_month = qualifier_analysis.get("expected_month")
+                qualifier_decision_role = qualifier_analysis.get("decision_maker_status")  # Same as decision_maker_status
+                qualifier_availability = qualifier_analysis.get("availability")
+                qualifier_missing_fields = qualifier_analysis.get("missing_fields")
+
+                # Sales Department Fields
+                sales_analysis = dept_analysis.get("sales_analysis", {}) or {}
+                sales_sql_eligible = sales_analysis.get("sql_eligible")
+                sales_notes_quality = sales_analysis.get("notes_quality")
+                sales_exit_status = sales_analysis.get("exit_status")
+                sales_parking_status = sales_analysis.get("parking_status")
+                sales_last_contact_days = None  # Calculated from last_contact_mentioned
+                sales_next_action = sales_analysis.get("next_action")
+                sales_qualification_reason = sales_analysis.get("qualification_reason")
+                sales_cadence_compliant = sales_analysis.get("cadence_compliant")
+
+                # Call Center Department Fields
+                cc_analysis = dept_analysis.get("call_centre_analysis", {}) or {}
+                cc_opening_compliant = cc_analysis.get("opening_compliant")
+                cc_opening_time_seconds = cc_analysis.get("opening_time_seconds")
+                cc_satisfaction_question_asked = cc_analysis.get("satisfaction_question_asked")
+                cc_customer_response = cc_analysis.get("customer_response")
+                cc_call_category = cc_analysis.get("call_category")
+                cc_whatsapp_handoff = cc_analysis.get("whatsapp_handoff", {}) or {}
+                cc_whatsapp_handoff_valid = cc_whatsapp_handoff.get("valid")
+                cc_premium_pitch_quality = cc_analysis.get("premium_pitch_quality")
+
+                # Cross-Department Fields
+                future_opportunities = cross_dept.get("future_opportunities")
+                industry_interests = cross_dept.get("industry_interests")
+                repeat_caller = cross_dept.get("repeat_caller")
+                if repeat_caller == "suspected":
+                    repeat_caller = True  # Treat suspected as True
+                compliance_alerts = dept_analysis.get("compliance_alerts")
+                sla_breach = False  # Will be calculated based on metrics
+                talk_time_data = cross_dept.get("talk_time_ratio", {}) or {}
+                talk_time_ratio = talk_time_data.get("staff_percent")
+                greeting_compliant = cross_dept.get("greeting_compliant")
+                duration_anomaly = cross_dept.get("duration_anomaly")
+                handoff_quality = cross_dept.get("handoff_quality")
+
+                # Full department analysis JSON
+                department_analysis_json = dept_analysis
+
                 if existing:
                     # Update existing
                     existing.recording_file = recording_file
@@ -1930,6 +1991,46 @@ async def _process_recording_task(
                     existing.processing_time_seconds = result.get("processing_time_seconds")
                     existing.model_used = result.get("model_used")
                     existing.error_message = None
+
+                    # Department-wise analysis fields
+                    existing.star_rating = star_rating
+                    existing.star_rating_justification = star_rating_justification
+                    existing.qualifier_requirement_type = qualifier_requirement_type
+                    existing.qualifier_timeline = qualifier_timeline
+                    existing.qualifier_decision_maker_status = qualifier_decision_maker_status
+                    existing.qualifier_appointment_offered = qualifier_appointment_offered
+                    existing.qualifier_fail_reason = qualifier_fail_reason
+                    existing.qualifier_service_name = qualifier_service_name
+                    existing.qualifier_short_description = qualifier_short_description
+                    existing.qualifier_expected_month = qualifier_expected_month
+                    existing.qualifier_decision_role = qualifier_decision_role
+                    existing.qualifier_availability = qualifier_availability
+                    existing.qualifier_missing_fields = qualifier_missing_fields
+                    existing.sales_sql_eligible = sales_sql_eligible
+                    existing.sales_notes_quality = sales_notes_quality
+                    existing.sales_exit_status = sales_exit_status
+                    existing.sales_parking_status = sales_parking_status
+                    existing.sales_last_contact_days = sales_last_contact_days
+                    existing.sales_next_action = sales_next_action
+                    existing.sales_qualification_reason = sales_qualification_reason
+                    existing.sales_cadence_compliant = sales_cadence_compliant
+                    existing.cc_opening_compliant = cc_opening_compliant
+                    existing.cc_opening_time_seconds = cc_opening_time_seconds
+                    existing.cc_satisfaction_question_asked = cc_satisfaction_question_asked
+                    existing.cc_customer_response = cc_customer_response
+                    existing.cc_call_category = cc_call_category
+                    existing.cc_whatsapp_handoff_valid = cc_whatsapp_handoff_valid
+                    existing.cc_premium_pitch_quality = cc_premium_pitch_quality
+                    existing.future_opportunities = future_opportunities
+                    existing.industry_interests = industry_interests
+                    existing.repeat_caller = repeat_caller
+                    existing.compliance_alerts = compliance_alerts
+                    existing.sla_breach = sla_breach
+                    existing.talk_time_ratio = talk_time_ratio
+                    existing.greeting_compliant = greeting_compliant
+                    existing.duration_anomaly = duration_anomaly
+                    existing.handoff_quality = handoff_quality
+                    existing.department_analysis = department_analysis_json
                 else:
                     # Create new
                     summary = CallSummary(
@@ -1979,6 +2080,45 @@ async def _process_recording_task(
                         customer_effort_score=customer_effort_score,
                         processing_time_seconds=result.get("processing_time_seconds"),
                         model_used=result.get("model_used"),
+                        # Department-wise analysis fields
+                        star_rating=star_rating,
+                        star_rating_justification=star_rating_justification,
+                        qualifier_requirement_type=qualifier_requirement_type,
+                        qualifier_timeline=qualifier_timeline,
+                        qualifier_decision_maker_status=qualifier_decision_maker_status,
+                        qualifier_appointment_offered=qualifier_appointment_offered,
+                        qualifier_fail_reason=qualifier_fail_reason,
+                        qualifier_service_name=qualifier_service_name,
+                        qualifier_short_description=qualifier_short_description,
+                        qualifier_expected_month=qualifier_expected_month,
+                        qualifier_decision_role=qualifier_decision_role,
+                        qualifier_availability=qualifier_availability,
+                        qualifier_missing_fields=qualifier_missing_fields,
+                        sales_sql_eligible=sales_sql_eligible,
+                        sales_notes_quality=sales_notes_quality,
+                        sales_exit_status=sales_exit_status,
+                        sales_parking_status=sales_parking_status,
+                        sales_last_contact_days=sales_last_contact_days,
+                        sales_next_action=sales_next_action,
+                        sales_qualification_reason=sales_qualification_reason,
+                        sales_cadence_compliant=sales_cadence_compliant,
+                        cc_opening_compliant=cc_opening_compliant,
+                        cc_opening_time_seconds=cc_opening_time_seconds,
+                        cc_satisfaction_question_asked=cc_satisfaction_question_asked,
+                        cc_customer_response=cc_customer_response,
+                        cc_call_category=cc_call_category,
+                        cc_whatsapp_handoff_valid=cc_whatsapp_handoff_valid,
+                        cc_premium_pitch_quality=cc_premium_pitch_quality,
+                        future_opportunities=future_opportunities,
+                        industry_interests=industry_interests,
+                        repeat_caller=repeat_caller,
+                        compliance_alerts=compliance_alerts,
+                        sla_breach=sla_breach,
+                        talk_time_ratio=talk_time_ratio,
+                        greeting_compliant=greeting_compliant,
+                        duration_anomaly=duration_anomaly,
+                        handoff_quality=handoff_quality,
+                        department_analysis=department_analysis_json,
                     )
                     db.add(summary)
 
@@ -2285,4 +2425,574 @@ async def fix_staff_records(
         "records_checked": records_checked,
         "records_updated": updated_count,
         "staff_directory": STAFF_DIRECTORY,
+    }
+
+
+# ============================================================================
+# DEPARTMENT-WISE ANALYTICS ENDPOINTS
+# ============================================================================
+
+from sqlalchemy import func, case, and_
+
+
+@router.get("/department-analytics/qualifier")
+async def get_qualifier_analytics(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get Qualifier department analytics including:
+    - Star rating distribution
+    - Fail reason breakdown
+    - Timeline distribution
+    - Missing fields compliance
+    - Appointment offer rate
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get qualifier calls
+    qualifier_calls = db.query(CallSummary).filter(
+        CallSummary.staff_department == "Qualifier",
+        CallSummary.created_at >= start_date,
+    ).all()
+
+    total_calls = len(qualifier_calls)
+    if total_calls == 0:
+        return {
+            "department": "Qualifier",
+            "period_days": days,
+            "total_calls": 0,
+            "star_distribution": {},
+            "fail_reasons": {},
+            "timeline_distribution": {},
+            "compliance": {},
+        }
+
+    # Star rating distribution
+    star_dist = {}
+    for rating in range(1, 6):
+        count = sum(1 for c in qualifier_calls if c.star_rating == rating)
+        star_dist[str(rating)] = {
+            "count": count,
+            "percentage": round(count / total_calls * 100, 1) if total_calls > 0 else 0,
+        }
+
+    # Fail reason breakdown (for 1-star calls)
+    fail_reasons = {}
+    one_star_calls = [c for c in qualifier_calls if c.star_rating == 1]
+    for call in one_star_calls:
+        reason = call.qualifier_fail_reason or "unknown"
+        fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+
+    # Timeline distribution
+    timeline_dist = {}
+    for call in qualifier_calls:
+        timeline = call.qualifier_timeline or "unknown"
+        timeline_dist[timeline] = timeline_dist.get(timeline, 0) + 1
+
+    # Compliance metrics
+    calls_with_missing = sum(1 for c in qualifier_calls if c.qualifier_missing_fields and len(c.qualifier_missing_fields) > 0)
+    appointment_offered = sum(1 for c in qualifier_calls if c.qualifier_appointment_offered is True)
+    high_value_calls = [c for c in qualifier_calls if c.star_rating and c.star_rating >= 4]
+
+    compliance = {
+        "calls_with_missing_fields": calls_with_missing,
+        "missing_fields_rate": round(calls_with_missing / total_calls * 100, 1) if total_calls > 0 else 0,
+        "appointment_offered_count": appointment_offered,
+        "appointment_offer_rate": round(appointment_offered / len(high_value_calls) * 100, 1) if high_value_calls else 0,
+        "high_value_calls": len(high_value_calls),
+    }
+
+    # Requirement type distribution
+    requirement_types = {}
+    for call in qualifier_calls:
+        req_type = call.qualifier_requirement_type or "unknown"
+        requirement_types[req_type] = requirement_types.get(req_type, 0) + 1
+
+    return {
+        "department": "Qualifier",
+        "period_days": days,
+        "total_calls": total_calls,
+        "star_distribution": star_dist,
+        "fail_reasons": fail_reasons,
+        "timeline_distribution": timeline_dist,
+        "requirement_types": requirement_types,
+        "compliance": compliance,
+    }
+
+
+@router.get("/department-analytics/sales")
+async def get_sales_analytics(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get Sales department analytics including:
+    - SQL eligible count and rate
+    - Exit status breakdown
+    - Parking status analysis
+    - Follow-up cadence compliance
+    - Notes quality distribution
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get sales calls
+    sales_calls = db.query(CallSummary).filter(
+        CallSummary.staff_department == "Sales",
+        CallSummary.created_at >= start_date,
+    ).all()
+
+    total_calls = len(sales_calls)
+    if total_calls == 0:
+        return {
+            "department": "Sales",
+            "period_days": days,
+            "total_calls": 0,
+            "sql_metrics": {},
+            "exit_status": {},
+            "parking_analysis": {},
+            "notes_quality": {},
+            "cadence_compliance": {},
+        }
+
+    # SQL metrics
+    sql_eligible = sum(1 for c in sales_calls if c.sales_sql_eligible is True)
+    sql_metrics = {
+        "sql_eligible_count": sql_eligible,
+        "sql_eligible_rate": round(sql_eligible / total_calls * 100, 1) if total_calls > 0 else 0,
+    }
+
+    # Star rating distribution
+    star_dist = {}
+    for rating in range(1, 6):
+        count = sum(1 for c in sales_calls if c.star_rating == rating)
+        star_dist[str(rating)] = {
+            "count": count,
+            "percentage": round(count / total_calls * 100, 1) if total_calls > 0 else 0,
+        }
+
+    # Exit status breakdown
+    exit_status = {}
+    for call in sales_calls:
+        status = call.sales_exit_status or "active"
+        exit_status[status] = exit_status.get(status, 0) + 1
+
+    # Parking analysis
+    parking_analysis = {
+        "parked_with_plan": sum(1 for c in sales_calls if c.sales_parking_status == "parked_with_plan"),
+        "parked_no_plan": sum(1 for c in sales_calls if c.sales_parking_status == "parked_no_plan"),
+        "active": sum(1 for c in sales_calls if c.sales_parking_status == "active"),
+    }
+
+    # High-value parked without plan (compliance issue)
+    parked_no_plan_high_value = sum(
+        1 for c in sales_calls
+        if c.sales_parking_status == "parked_no_plan" and c.star_rating and c.star_rating >= 4
+    )
+    parking_analysis["high_value_parked_no_plan"] = parked_no_plan_high_value
+
+    # Notes quality distribution
+    notes_quality = {}
+    for call in sales_calls:
+        quality = call.sales_notes_quality or "unknown"
+        notes_quality[quality] = notes_quality.get(quality, 0) + 1
+
+    # Cadence compliance
+    cadence_compliant = sum(1 for c in sales_calls if c.sales_cadence_compliant is True)
+    cadence_compliance = {
+        "compliant_count": cadence_compliant,
+        "compliance_rate": round(cadence_compliant / total_calls * 100, 1) if total_calls > 0 else 0,
+    }
+
+    return {
+        "department": "Sales",
+        "period_days": days,
+        "total_calls": total_calls,
+        "star_distribution": star_dist,
+        "sql_metrics": sql_metrics,
+        "exit_status": exit_status,
+        "parking_analysis": parking_analysis,
+        "notes_quality": notes_quality,
+        "cadence_compliance": cadence_compliance,
+    }
+
+
+@router.get("/department-analytics/call-centre")
+async def get_call_centre_analytics(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get Call Centre department analytics including:
+    - Opening compliance rate
+    - Call category distribution
+    - Satisfaction question rate
+    - Customer response breakdown
+    - Premium pitch quality
+    - WhatsApp handoff stats
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get call centre calls
+    cc_calls = db.query(CallSummary).filter(
+        CallSummary.staff_department == "Call Centre",
+        CallSummary.created_at >= start_date,
+    ).all()
+
+    total_calls = len(cc_calls)
+    if total_calls == 0:
+        return {
+            "department": "Call Centre",
+            "period_days": days,
+            "total_calls": 0,
+            "opening_compliance": {},
+            "call_categories": {},
+            "satisfaction_metrics": {},
+            "premium_pitch": {},
+            "whatsapp_handoff": {},
+        }
+
+    # Opening compliance
+    opening_compliant = sum(1 for c in cc_calls if c.cc_opening_compliant is True)
+    avg_opening_time = 0
+    calls_with_time = [c for c in cc_calls if c.cc_opening_time_seconds is not None]
+    if calls_with_time:
+        avg_opening_time = sum(c.cc_opening_time_seconds for c in calls_with_time) / len(calls_with_time)
+
+    opening_compliance = {
+        "compliant_count": opening_compliant,
+        "compliance_rate": round(opening_compliant / total_calls * 100, 1) if total_calls > 0 else 0,
+        "avg_opening_time_seconds": round(avg_opening_time, 1),
+    }
+
+    # Call category distribution
+    call_categories = {}
+    for call in cc_calls:
+        category = call.cc_call_category or "unknown"
+        call_categories[category] = call_categories.get(category, 0) + 1
+
+    # Satisfaction question metrics
+    satisfaction_asked = sum(1 for c in cc_calls if c.cc_satisfaction_question_asked is True)
+    customer_responses = {}
+    for call in cc_calls:
+        response = call.cc_customer_response or "not_asked"
+        customer_responses[response] = customer_responses.get(response, 0) + 1
+
+    satisfaction_metrics = {
+        "question_asked_count": satisfaction_asked,
+        "question_asked_rate": round(satisfaction_asked / total_calls * 100, 1) if total_calls > 0 else 0,
+        "customer_responses": customer_responses,
+    }
+
+    # Premium pitch quality
+    premium_pitch = {}
+    for call in cc_calls:
+        quality = call.cc_premium_pitch_quality or "none"
+        premium_pitch[quality] = premium_pitch.get(quality, 0) + 1
+
+    # WhatsApp handoff
+    whatsapp_offered = sum(1 for c in cc_calls if c.cc_whatsapp_handoff_valid is not None)
+    whatsapp_valid = sum(1 for c in cc_calls if c.cc_whatsapp_handoff_valid is True)
+    whatsapp_handoff = {
+        "offered_count": whatsapp_offered,
+        "valid_count": whatsapp_valid,
+        "validity_rate": round(whatsapp_valid / whatsapp_offered * 100, 1) if whatsapp_offered > 0 else 0,
+    }
+
+    # Star rating distribution
+    star_dist = {}
+    for rating in range(1, 6):
+        count = sum(1 for c in cc_calls if c.star_rating == rating)
+        star_dist[str(rating)] = {
+            "count": count,
+            "percentage": round(count / total_calls * 100, 1) if total_calls > 0 else 0,
+        }
+
+    return {
+        "department": "Call Centre",
+        "period_days": days,
+        "total_calls": total_calls,
+        "star_distribution": star_dist,
+        "opening_compliance": opening_compliance,
+        "call_categories": call_categories,
+        "satisfaction_metrics": satisfaction_metrics,
+        "premium_pitch": premium_pitch,
+        "whatsapp_handoff": whatsapp_handoff,
+    }
+
+
+@router.get("/compliance-alerts")
+async def get_compliance_alerts(
+    days: int = 30,
+    department: str = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get compliance alerts across all departments.
+    Returns calls with compliance issues that need attention.
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Build query
+    query = db.query(CallSummary).filter(
+        CallSummary.created_at >= start_date,
+        CallSummary.compliance_alerts.isnot(None),
+    )
+
+    if department:
+        query = query.filter(CallSummary.staff_department == department)
+
+    calls_with_alerts = query.all()
+
+    alerts = []
+    for call in calls_with_alerts:
+        if call.compliance_alerts and len(call.compliance_alerts) > 0:
+            alerts.append({
+                "call_id": call.call_id,
+                "staff_name": call.staff_name,
+                "staff_department": call.staff_department,
+                "star_rating": call.star_rating,
+                "alerts": call.compliance_alerts,
+                "created_at": call.created_at.isoformat() if call.created_at else None,
+            })
+
+    # Group by alert type
+    alert_summary = {}
+    for alert_item in alerts:
+        for alert_text in alert_item.get("alerts", []):
+            alert_summary[alert_text] = alert_summary.get(alert_text, 0) + 1
+
+    return {
+        "period_days": days,
+        "department_filter": department,
+        "total_calls_with_alerts": len(alerts),
+        "alert_summary": alert_summary,
+        "recent_alerts": alerts[:50],  # Return last 50
+    }
+
+
+@router.get("/star-rating-distribution")
+async def get_star_rating_distribution(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get star rating distribution across all departments.
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get all calls with star ratings
+    calls = db.query(CallSummary).filter(
+        CallSummary.created_at >= start_date,
+        CallSummary.star_rating.isnot(None),
+    ).all()
+
+    # Overall distribution
+    overall = {}
+    for rating in range(1, 6):
+        count = sum(1 for c in calls if c.star_rating == rating)
+        overall[str(rating)] = count
+
+    # By department
+    departments = ["Qualifier", "Sales", "Call Centre"]
+    by_department = {}
+
+    for dept in departments:
+        dept_calls = [c for c in calls if c.staff_department == dept]
+        dept_dist = {}
+        for rating in range(1, 6):
+            count = sum(1 for c in dept_calls if c.star_rating == rating)
+            dept_dist[str(rating)] = count
+        by_department[dept] = {
+            "total": len(dept_calls),
+            "distribution": dept_dist,
+            "average": round(sum(c.star_rating for c in dept_calls) / len(dept_calls), 2) if dept_calls else 0,
+        }
+
+    # By staff member
+    by_staff = {}
+    for call in calls:
+        staff_name = call.staff_name or "Unknown"
+        if staff_name not in by_staff:
+            by_staff[staff_name] = {
+                "department": call.staff_department,
+                "total": 0,
+                "ratings": [],
+            }
+        by_staff[staff_name]["total"] += 1
+        by_staff[staff_name]["ratings"].append(call.star_rating)
+
+    # Calculate averages for each staff
+    for staff_name in by_staff:
+        ratings = by_staff[staff_name]["ratings"]
+        by_staff[staff_name]["average"] = round(sum(ratings) / len(ratings), 2) if ratings else 0
+        by_staff[staff_name]["distribution"] = {
+            str(r): ratings.count(r) for r in range(1, 6)
+        }
+        del by_staff[staff_name]["ratings"]  # Remove raw ratings
+
+    return {
+        "period_days": days,
+        "total_rated_calls": len(calls),
+        "overall_distribution": overall,
+        "overall_average": round(sum(c.star_rating for c in calls) / len(calls), 2) if calls else 0,
+        "by_department": by_department,
+        "by_staff": by_staff,
+    }
+
+
+@router.get("/repeat-caller-analysis")
+async def get_repeat_caller_analysis(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Analyze repeat caller patterns.
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get calls marked as repeat caller
+    repeat_calls = db.query(CallSummary).filter(
+        CallSummary.created_at >= start_date,
+        CallSummary.repeat_caller == True,
+    ).all()
+
+    # Group by customer phone
+    by_phone = {}
+    for call in repeat_calls:
+        phone = call.customer_phone or "unknown"
+        if phone not in by_phone:
+            by_phone[phone] = {
+                "calls": [],
+                "departments_contacted": set(),
+            }
+        by_phone[phone]["calls"].append({
+            "call_id": call.call_id,
+            "staff_name": call.staff_name,
+            "department": call.staff_department,
+            "call_type": call.call_type,
+            "created_at": call.created_at.isoformat() if call.created_at else None,
+        })
+        by_phone[phone]["departments_contacted"].add(call.staff_department)
+
+    # Convert sets to lists for JSON serialization
+    for phone in by_phone:
+        by_phone[phone]["departments_contacted"] = list(by_phone[phone]["departments_contacted"])
+        by_phone[phone]["call_count"] = len(by_phone[phone]["calls"])
+
+    # Sort by call count (most calls first)
+    sorted_callers = sorted(by_phone.items(), key=lambda x: x[1]["call_count"], reverse=True)
+
+    # Summary stats
+    total_repeat_calls = len(repeat_calls)
+    unique_repeat_callers = len(by_phone)
+
+    return {
+        "period_days": days,
+        "total_repeat_calls": total_repeat_calls,
+        "unique_repeat_callers": unique_repeat_callers,
+        "top_repeat_callers": dict(sorted_callers[:20]),  # Top 20
+    }
+
+
+@router.get("/future-opportunities")
+async def get_future_opportunities(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get detected future opportunities from calls.
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get calls with future opportunities
+    calls = db.query(CallSummary).filter(
+        CallSummary.created_at >= start_date,
+        CallSummary.future_opportunities.isnot(None),
+    ).all()
+
+    # Aggregate opportunities
+    opportunity_counts = {}
+    opportunity_details = []
+
+    for call in calls:
+        if call.future_opportunities and len(call.future_opportunities) > 0:
+            for opp in call.future_opportunities:
+                opportunity_counts[opp] = opportunity_counts.get(opp, 0) + 1
+
+            opportunity_details.append({
+                "call_id": call.call_id,
+                "customer_name": call.customer_name,
+                "customer_phone": call.customer_phone,
+                "opportunities": call.future_opportunities,
+                "staff_department": call.staff_department,
+                "created_at": call.created_at.isoformat() if call.created_at else None,
+            })
+
+    # Sort opportunities by count
+    sorted_opportunities = sorted(opportunity_counts.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "period_days": days,
+        "total_calls_with_opportunities": len(calls),
+        "opportunity_counts": dict(sorted_opportunities),
+        "recent_opportunities": opportunity_details[:50],
+    }
+
+
+@router.get("/industry-interests")
+async def get_industry_interests(
+    days: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get detected industry interests from calls.
+    """
+    from datetime import datetime, timedelta
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    # Get calls with industry interests
+    calls = db.query(CallSummary).filter(
+        CallSummary.created_at >= start_date,
+        CallSummary.industry_interests.isnot(None),
+    ).all()
+
+    # Aggregate industries
+    industry_counts = {}
+
+    for call in calls:
+        if call.industry_interests and len(call.industry_interests) > 0:
+            for industry in call.industry_interests:
+                industry_counts[industry] = industry_counts.get(industry, 0) + 1
+
+    # Sort industries by count
+    sorted_industries = sorted(industry_counts.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        "period_days": days,
+        "total_calls_with_industry": len(calls),
+        "industry_distribution": dict(sorted_industries),
     }

@@ -22,16 +22,18 @@ settings = get_settings()
 
 # Staff extension mapping - maps extensions to staff details
 STAFF_EXTENSION_MAP = {
-    # Call Centre Team
+    # Call Centre Team (Extensions 201-203)
     "201": {"name": "Jijina", "department": "Call Centre", "role": "Call Centre Agent"},
     "202": {"name": "Joanna", "department": "Call Centre", "role": "Call Centre Agent"},
     "203": {"name": "Ramshad", "department": "Call Centre", "role": "Call Centre Agent"},
-    # Sales Team
+    # Sales Team (Extensions 111, 207-211)
     "111": {"name": "Amith", "department": "Sales", "role": "Sales Agent"},
     "207": {"name": "Saumil", "department": "Sales", "role": "Sales Agent"},
     "208": {"name": "Pranay", "department": "Sales", "role": "Sales Agent"},
     "209": {"name": "Sai", "department": "Sales", "role": "Sales Agent"},
     "211": {"name": "Swaroop", "department": "Sales", "role": "Sales Agent"},
+    # Qualifier Team (Extension 221)
+    "221": {"name": "Qualifier Agent", "department": "Qualifier", "role": "Qualifier Agent"},
 }
 
 def get_staff_from_extension(extension: str) -> dict:
@@ -344,6 +346,298 @@ CRITICAL RULES:
 12. COACHING: Provide specific coaching notes that would help improve performance
 
 Return ONLY valid JSON, no other text."""
+
+
+# ==================== DEPARTMENT-SPECIFIC PROMPT TEMPLATES ====================
+
+QUALIFIER_PROMPT_TEMPLATE = """
+═══════════════════════════════════════════════════════════════════════════════
+QUALIFIER DEPARTMENT ANALYSIS - ADDITIONAL FIELDS REQUIRED:
+═══════════════════════════════════════════════════════════════════════════════
+
+The staff member handling this call is from the QUALIFIER department. Analyze the call for lead qualification with these specific criteria:
+
+**5 MANDATORY QUALIFICATION FIELDS TO DETECT:**
+1. **Service Name** - The EXACT service mentioned (not generic like "just checking" or "need information")
+2. **Short Description** - 1-line description of the customer's requirement
+3. **Timeline** - Classify as one of:
+   - "immediate" (0-7 days)
+   - "short_term" (8-30 days)
+   - "mid_term" (31-90 days)
+   - "long_term" (90+ days)
+   - "no_timeline" (no timeline mentioned)
+4. **Expected Month** - Required if timeline is "long_term" (e.g., "March 2026")
+5. **Decision Role + Availability** - Is caller the decision maker? Are they available?
+
+**STAR RATING CRITERIA (1-5):**
+- **5 Star**: Specific requirement + Immediate/Short-term timeline + Decision maker + Available for appointment
+- **4 Star**: Specific requirement + Mid-term timeline OR not decision maker but can influence
+- **3 Star**: Somewhat specific + Long-term timeline OR vague timeline
+- **2 Star**: Vague requirement but genuine interest
+- **1 Star**: "Just checking", "need details only", no real intent, spam, wrong number
+
+**FAIL CONDITIONS (1-star automatic):**
+- Customer says "just checking" or "just inquiring" with no specific need
+- Customer only wants to collect information for someone else (third party consultant)
+- Extremely vague inquiry with no identifiable service interest
+- Spam, wrong number, or irrelevant call
+
+**COMPLIANCE ALERTS (generate if any mandatory field is missing):**
+- "Missing: Service Name" if no specific service identified
+- "Missing: Timeline" if no timeline established
+- "Missing: Decision Role" if decision maker status not clarified
+- "Missing: Appointment Offer" if qualifier didn't offer to book appointment for 4-5 star leads
+
+Add this to your JSON response:
+{{
+    "department_analysis": {{
+        "department": "Qualifier",
+        "star_rating": 1-5,
+        "star_rating_justification": "Explain why this rating was given",
+        "qualifier_analysis": {{
+            "requirement_type": "specific|vague|none",
+            "service_name": "Exact service name or null",
+            "short_description": "1-line requirement description or null",
+            "timeline": "immediate|short_term|mid_term|long_term|no_timeline",
+            "expected_month": "Month/Year if long_term, otherwise null",
+            "decision_maker_status": "decision_maker|influencer|consultant|third_party|unknown",
+            "availability": true|false|null,
+            "appointment_offered": true|false,
+            "fail_reason": "just_checking|need_details_only|vague_inquiry|third_party|spam|wrong_number|null",
+            "missing_fields": ["List of missing mandatory fields"],
+            "qualification_notes": "Brief notes on qualification outcome"
+        }},
+        "compliance_alerts": ["List any compliance issues or missing mandatory actions"]
+    }}
+}}
+"""
+
+SALES_PROMPT_TEMPLATE = """
+═══════════════════════════════════════════════════════════════════════════════
+SALES DEPARTMENT ANALYSIS - ADDITIONAL FIELDS REQUIRED:
+═══════════════════════════════════════════════════════════════════════════════
+
+The staff member handling this call is from the SALES department. Analyze the call for sales performance metrics:
+
+**SQL (SALES QUALIFIED LEAD) ELIGIBILITY:**
+- Only 2-5 star leads are SQL eligible
+- 1-star leads (just checking, spam, wrong number) are NOT SQL eligible
+
+**STAR RATING VALIDATION:**
+- Must align with the qualifier's criteria if lead was pre-qualified
+- If this is a follow-up call, assess current status vs original rating
+
+**NOTES QUALITY ASSESSMENT:**
+- "complete": Has qualification reason, rating justification, timeline, next action
+- "partial": Missing some elements
+- "missing": No proper notes/documentation evident from call
+
+**EXIT STATUS DEFINITIONS:**
+- "converted": Deal closed, customer signed up
+- "lost_competitor": Lost to a named competitor
+- "lost_pricing": Lost due to pricing concerns
+- "closed": Customer decided not to proceed (not competitor/pricing)
+- "unqualified": Lead disqualified during sales process
+- "active": Still in sales pipeline
+- "parked_with_plan": Intentionally paused with a follow-up plan
+- "parked_no_plan": Parked without clear next steps (compliance issue!)
+
+**FOLLOW-UP CADENCE RULES:**
+- 5-star leads: Contact every 10 days
+- 4-star leads: Contact every 15 days
+- 3-star leads: Contact every 20 days
+- 2-star leads: Contact every 30 days
+- Overdue alerts: 25 days, 30 days, 50 days, 60 days without contact
+
+**PARKING COMPLIANCE:**
+- 4-5 star leads MUST have an execution plan when parked
+- Parking without a plan is a compliance violation
+
+Add this to your JSON response:
+{{
+    "department_analysis": {{
+        "department": "Sales",
+        "star_rating": 1-5,
+        "star_rating_justification": "Explain why this rating was given",
+        "sales_analysis": {{
+            "sql_eligible": true|false,
+            "notes_quality": "complete|partial|missing",
+            "exit_status": "converted|lost_competitor|lost_pricing|closed|unqualified|active|parked_with_plan|parked_no_plan",
+            "parking_status": "active|parked_with_plan|parked_no_plan|null",
+            "last_contact_mentioned": "Date if mentioned, otherwise null",
+            "next_action": "Specific next action to take",
+            "qualification_reason": "Why this lead has this star rating",
+            "cadence_compliant": true|false|null,
+            "competitor_mentioned": "Competitor name if mentioned, otherwise null",
+            "objections_raised": ["List of customer objections"],
+            "objection_handling": "How staff handled objections"
+        }},
+        "compliance_alerts": ["List any compliance issues like parking 4-5 star without plan"]
+    }}
+}}
+"""
+
+CALL_CENTRE_PROMPT_TEMPLATE = """
+═══════════════════════════════════════════════════════════════════════════════
+CALL CENTRE DEPARTMENT ANALYSIS - ADDITIONAL FIELDS REQUIRED:
+═══════════════════════════════════════════════════════════════════════════════
+
+The staff member handling this call is from the CALL CENTRE department. Analyze for call center KPIs:
+
+**OPENING COMPLIANCE:**
+- Proper greeting should happen within 20 seconds
+- Must include: Greeting + Company name + Staff name + "How can I help you?"
+- Example: "Good morning, Amer Centre, this is Jijina speaking. How may I assist you today?"
+
+**CALL CATEGORIZATION:**
+- "status": Customer checking status of existing application/process
+- "new_inquiry": New service inquiry
+- "document": Document-related queries (what to bring, what's missing)
+- "office_info": Office hours, location, directions
+- "complaint": Customer complaint or escalation
+- "callback": Customer returning a missed call
+- "transfer": Call needs to be transferred to another department
+
+**CUSTOMER SATISFACTION CLOSING:**
+- Staff MUST ask: "Is there anything else I can help you with?" or similar
+- Track customer's response: positive, negative, or unclear
+
+**WHATSAPP HANDOFF:**
+- If staff asks customer to send documents via WhatsApp, note this
+- Valid handoff = clear instructions on what to send and to which number
+
+**PREMIUM SERVICE PITCH:**
+- "benefit_first": Staff explained benefits before mentioning cost (good)
+- "pushy": Staff pushed premium service without explaining value (poor)
+- "appropriate": Mentioned premium option appropriately when relevant
+- "none": No premium service mentioned (neutral)
+
+**REPEAT CALLER INDICATORS:**
+- Customer mentions calling before
+- References previous conversation or staff member
+- Has existing application/file number
+
+Add this to your JSON response:
+{{
+    "department_analysis": {{
+        "department": "Call Centre",
+        "star_rating": 1-5,
+        "star_rating_justification": "Based on call handling quality and customer satisfaction",
+        "call_centre_analysis": {{
+            "opening_compliant": true|false,
+            "opening_time_seconds": estimated seconds to proper greeting (<=20 is compliant),
+            "satisfaction_question_asked": true|false,
+            "customer_response": "positive|negative|unclear|not_asked",
+            "call_category": "status|new_inquiry|document|office_info|complaint|callback|transfer",
+            "whatsapp_handoff": {{
+                "offered": true|false,
+                "valid": true|false|null,
+                "instructions_clear": true|false|null
+            }},
+            "premium_pitch_quality": "benefit_first|pushy|appropriate|none",
+            "repeat_caller_indicators": ["List any indicators that this is a repeat caller"],
+            "is_repeat_caller": true|false|"suspected",
+            "hold_time_appropriate": true|false|"no_hold",
+            "transfer_handled_properly": true|false|"no_transfer"
+        }},
+        "compliance_alerts": ["List any compliance issues like missing satisfaction question"]
+    }}
+}}
+"""
+
+CROSS_DEPARTMENT_PROMPT_TEMPLATE = """
+═══════════════════════════════════════════════════════════════════════════════
+CROSS-DEPARTMENT ANALYSIS - ADDITIONAL FIELDS FOR ALL CALLS:
+═══════════════════════════════════════════════════════════════════════════════
+
+Regardless of department, analyze these universal metrics:
+
+**FUTURE OPPORTUNITY DETECTION:**
+Identify if the customer mentioned interest in any of these future services:
+- "Residency": Visa/residency related
+- "Property": Real estate, property purchase
+- "Business Expansion": New business setup, additional licenses
+- "Banking": Bank account, business banking
+- "Compliance": VAT, corporate tax, audit
+- "Investments": Investment visa, investor services
+- "Lifestyle": PRO services for family, domestic help visa
+- "Branding": Trademark, brand registration
+
+**INDUSTRY INTEREST DETECTION:**
+Identify the customer's industry/sector if mentioned:
+Technology, Healthcare, Education, Real Estate, Hospitality, F&B, Retail,
+Manufacturing, Trading, Consulting, Legal, Finance, Construction, Transportation,
+Media, Entertainment, Sports, Agriculture, Energy, Logistics, E-commerce
+
+**HANDOFF QUALITY:**
+- "good": Smooth handoff with context provided
+- "poor": Abrupt transfer without context
+- "none": No handoff in this call
+
+**TALK TIME RATIO:**
+- Estimate staff vs customer talk time percentage
+- Ideal is 30-40% staff, 60-70% customer (staff should listen more)
+
+**GREETING COMPLIANCE:**
+- Did staff greet appropriately for time of day?
+- Did staff introduce themselves and company?
+
+**DURATION ANOMALY:**
+- Very short (<30 sec) for service inquiry = potential issue
+- Very long (>15 min) for simple query = potential issue
+
+Add this to your JSON response (merge with department_analysis):
+{{
+    "cross_department": {{
+        "future_opportunities": ["List detected opportunity tags"],
+        "industry_interests": ["List detected industries"],
+        "handoff_quality": "good|poor|none",
+        "talk_time_ratio": {{
+            "staff_percent": estimated percentage,
+            "customer_percent": estimated percentage,
+            "assessment": "appropriate|staff_talks_too_much|staff_talks_too_little"
+        }},
+        "greeting_compliant": true|false,
+        "duration_anomaly": true|false,
+        "duration_anomaly_reason": "too_short|too_long|null",
+        "repeat_caller": true|false|"suspected"
+    }}
+}}
+"""
+
+
+def get_department_prompt(department: str) -> str:
+    """Get department-specific prompt addition based on staff department."""
+    prompts = {
+        "Qualifier": QUALIFIER_PROMPT_TEMPLATE,
+        "Sales": SALES_PROMPT_TEMPLATE,
+        "Call Centre": CALL_CENTRE_PROMPT_TEMPLATE,
+    }
+
+    # Always include cross-department analysis
+    department_prompt = prompts.get(department, "")
+    return department_prompt + CROSS_DEPARTMENT_PROMPT_TEMPLATE
+
+
+def compose_full_prompt(transcript: str, recording_context: str, department: str = None) -> str:
+    """Compose the full analysis prompt with department-specific additions."""
+    base_prompt = SUMMARY_PROMPT_TEMPLATE.format(
+        transcript=transcript,
+        recording_context=recording_context if recording_context else "No additional context available."
+    )
+
+    # Get department-specific prompt
+    if department and department != "Unknown":
+        department_prompt = get_department_prompt(department)
+        # Insert department prompt before the CRITICAL RULES section
+        critical_rules_marker = "═══════════════════════════════════════════════════════════════════════════════\nCRITICAL RULES:"
+        if critical_rules_marker in base_prompt:
+            base_prompt = base_prompt.replace(
+                critical_rules_marker,
+                department_prompt + "\n" + critical_rules_marker
+            )
+
+    return base_prompt
 
 
 # ============== Transformers Whisper ASR Engine with Speaker Diarization ==============
@@ -754,13 +1048,18 @@ class LLMAnalysisService:
         except:
             return False
 
-    async def analyze_transcript(self, transcript: str, recording_context: str = "") -> Dict[str, Any]:
-        """Analyze call transcript and extract structured information."""
+    async def analyze_transcript(self, transcript: str, recording_context: str = "", department: str = None) -> Dict[str, Any]:
+        """Analyze call transcript and extract structured information.
 
-        prompt = SUMMARY_PROMPT_TEMPLATE.format(
-            transcript=transcript,
-            recording_context=recording_context if recording_context else "No additional context available."
-        )
+        Args:
+            transcript: The call transcript text
+            recording_context: Additional context about the recording (extension, staff, direction)
+            department: Staff department for department-specific analysis (Qualifier, Sales, Call Centre)
+        """
+        # Use department-aware prompt composition
+        prompt = compose_full_prompt(transcript, recording_context, department)
+
+        logger.info(f"Analyzing transcript for department: {department or 'Unknown'}")
 
         # Determine which backend to use
         if self._use_vllm is None:
@@ -1005,9 +1304,10 @@ class AITranscriptionService:
         transcript: str,
         model: str = None,
         recording_context: str = "",
+        department: str = None,
     ) -> Dict[str, Any]:
-        """Analyze transcript using Llama 3.1 8B."""
-        return await self._llm_service.analyze_transcript(transcript, recording_context)
+        """Analyze transcript using Llama 3.1 8B with department-specific prompts."""
+        return await self._llm_service.analyze_transcript(transcript, recording_context, department)
 
     async def process_recording(
         self,
@@ -1023,6 +1323,7 @@ class AITranscriptionService:
         extension = None
         call_direction = None
         recording_context = ""
+        staff_info = {}  # Initialize staff_info early
 
         filename = recording_file or os.path.basename(audio_path)
         if filename:
@@ -1032,7 +1333,7 @@ class AITranscriptionService:
             if ext_match:
                 extension = ext_match.group(1)
                 staff_info = get_staff_from_extension(extension)
-                if staff_info["name"]:
+                if staff_info.get("name"):
                     recording_context = f"Extension: {extension}\nStaff Member: {staff_info['name']}\nDepartment: {staff_info['department']}\nRole: {staff_info['role']}"
 
             # Extract direction
@@ -1101,17 +1402,16 @@ class AITranscriptionService:
                 "analysis_skip_reason": validation_reason,
             }
 
-        logger.info(f"Transcription complete, analyzing with {settings.ollama_model}...")
+        # Get department from staff info (staff_info is already populated if extension was found)
+        staff_department = staff_info.get("department") if staff_info else None
+        logger.info(f"Transcription complete, analyzing with {settings.ollama_model} for department: {staff_department or 'Unknown'}...")
 
-        # Step 2: Analyze with recording context
-        analysis = await self._llm_service.analyze_transcript(transcript, recording_context)
+        # Step 2: Analyze with recording context and department-specific prompts
+        analysis = await self._llm_service.analyze_transcript(transcript, recording_context, staff_department)
 
         processing_time = (datetime.now() - start_time).total_seconds()
 
-        # Get staff info from extension for the result
-        staff_info = get_staff_from_extension(extension) if extension else {}
-
-        # If analysis succeeded, enrich with extension-based staff info
+        # If analysis succeeded, enrich with extension-based staff info (staff_info already populated)
         summary_data = analysis.get("data") if analysis.get("success") else None
         if summary_data and extension:
             # Set staff info from extension if not already in analysis
