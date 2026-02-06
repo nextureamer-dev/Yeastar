@@ -1,13 +1,16 @@
 from datetime import timedelta
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models.user import User
+from app.models.department import Department
 from app.schemas.user import (
     UserCreate,
     UserResponse,
     UserUpdate,
+    UserAdminUpdate,
     Token,
     LoginRequest,
 )
@@ -17,6 +20,7 @@ from app.services.auth import (
     get_password_hash,
     get_current_user_required,
     get_admin_user,
+    get_superadmin_user,
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 
@@ -64,6 +68,17 @@ def register(
                 detail="Email already registered",
             )
 
+    # Validate department_id if provided
+    if user_data.department_id:
+        department = db.query(Department).filter(
+            Department.id == user_data.department_id
+        ).first()
+        if not department:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Department not found",
+            )
+
     # Create user
     role = getattr(user_data, 'role', 'employee') or 'employee'
     user = User(
@@ -71,6 +86,7 @@ def register(
         email=user_data.email,
         full_name=user_data.full_name,
         extension=user_data.extension,
+        department_id=user_data.department_id,
         hashed_password=get_password_hash(user_data.password),
         role=role,
     )
@@ -137,12 +153,156 @@ def update_current_user(
 
 @router.get("/users", response_model=list[UserResponse])
 def list_users(
+    department_id: Optional[int] = None,
+    role: Optional[str] = None,
+    is_active: Optional[bool] = None,
     admin: User = Depends(get_admin_user),
     db: Session = Depends(get_db),
 ):
-    """List all users (admin only)."""
-    users = db.query(User).all()
+    """List all users with optional filters (admin only)."""
+    query = db.query(User).options(joinedload(User.department))
+
+    if department_id is not None:
+        query = query.filter(User.department_id == department_id)
+    if role is not None:
+        query = query.filter(User.role == role)
+    if is_active is not None:
+        query = query.filter(User.is_active == is_active)
+
+    users = query.order_by(User.username).all()
     return [UserResponse.model_validate(u) for u in users]
+
+
+@router.get("/users/{user_id}", response_model=UserResponse)
+def get_user(
+    user_id: int,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Get a specific user (admin only)."""
+    user = db.query(User).options(
+        joinedload(User.department)
+    ).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserResponse.model_validate(user)
+
+
+@router.put("/users/{user_id}", response_model=UserResponse)
+def update_user(
+    user_id: int,
+    user_data: UserAdminUpdate,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Update a user (admin only). Role changes require superadmin."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Check if trying to change role - requires superadmin
+    if user_data.role is not None and user_data.role != user.role:
+        if not admin.is_superadmin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only superadmin can change user roles",
+            )
+
+        user.role = user_data.role
+        if user_data.role == "superadmin":
+            user.is_superadmin = True
+            user.is_admin = True
+        elif user_data.role == "admin":
+            user.is_admin = True
+            user.is_superadmin = False
+        else:
+            user.is_admin = False
+            user.is_superadmin = False
+
+    # Update other fields
+    if user_data.username is not None and user_data.username != user.username:
+        existing = db.query(User).filter(User.username == user_data.username).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken",
+            )
+        user.username = user_data.username
+
+    if user_data.email is not None and user_data.email != user.email:
+        if user_data.email:  # Only check if not empty
+            existing = db.query(User).filter(User.email == user_data.email).first()
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already registered",
+                )
+        user.email = user_data.email
+
+    if user_data.full_name is not None:
+        user.full_name = user_data.full_name
+
+    if user_data.extension is not None:
+        user.extension = user_data.extension
+
+    if user_data.department_id is not None:
+        if user_data.department_id:
+            department = db.query(Department).filter(
+                Department.id == user_data.department_id
+            ).first()
+            if not department:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Department not found",
+                )
+        user.department_id = user_data.department_id
+
+    if user_data.is_active is not None:
+        if user.id == admin.id and not user_data.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot deactivate yourself",
+            )
+        user.is_active = user_data.is_active
+
+    if user_data.password:
+        user.hashed_password = get_password_hash(user_data.password)
+
+    db.commit()
+
+    # Reload with department
+    user = db.query(User).options(
+        joinedload(User.department)
+    ).filter(User.id == user_id).first()
+
+    return UserResponse.model_validate(user)
+
+
+@router.post("/users/{user_id}/assign-department", response_model=UserResponse)
+def assign_user_department(
+    user_id: int,
+    department_id: int,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Assign a department to a user (admin only)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    department = db.query(Department).filter(Department.id == department_id).first()
+    if not department:
+        raise HTTPException(status_code=404, detail="Department not found")
+
+    user.department_id = department_id
+    db.commit()
+
+    # Reload with department
+    user = db.query(User).options(
+        joinedload(User.department)
+    ).filter(User.id == user_id).first()
+
+    return UserResponse.model_validate(user)
 
 
 @router.delete("/users/{user_id}", status_code=204)

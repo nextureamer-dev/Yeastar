@@ -5,8 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import engine, Base
-from app.routers import contacts, calls, extensions, pbx, webhook, notes, auth, transcription
+from app.routers import contacts, calls, extensions, pbx, webhook, notes, auth, transcription, departments
 from app.models.user import User  # Import to ensure table is created
+from app.models.department import Department  # Import to ensure table is created
 from app.services.yeastar_client import get_yeastar_client
 from app.services.websocket_manager import get_websocket_manager
 from app.services.webhook_handler import subscribe
@@ -304,6 +305,7 @@ app.include_router(webhook.router, prefix="/api")
 app.include_router(notes.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(transcription.router, prefix="/api")
+app.include_router(departments.router, prefix="/api")
 
 
 @app.get("/")
