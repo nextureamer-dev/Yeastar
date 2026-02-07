@@ -11,6 +11,7 @@ Supported languages: Hindi, Arabic, Malayalam, English (and 90+ others)
 import asyncio
 import logging
 import os
+import threading
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import httpx
@@ -652,6 +653,7 @@ class WhisperEngine:
         self._diarization_loaded = False
         self._loading = False
         self._lock = asyncio.Lock()
+        self._gpu_lock = threading.Lock()  # Serializes GPU inference across threads
         self._device = None
         self._hf_token = os.environ.get("HF_TOKEN")  # HuggingFace token for pyannote
 
@@ -895,13 +897,14 @@ class WhisperEngine:
                     "Amer Centre, Nexture, GDRFA, ICP, medical fitness, typing services."
                 )
 
-                result = self._pipe(
-                    audio_path,
-                    chunk_length_s=30,
-                    batch_size=16,  # Reduced for better accuracy
-                    return_timestamps=True,
-                    generate_kwargs=generate_kwargs,
-                )
+                with self._gpu_lock:  # Serialize GPU inference across threads
+                    result = self._pipe(
+                        audio_path,
+                        chunk_length_s=30,
+                        batch_size=16,  # Reduced for better accuracy
+                        return_timestamps=True,
+                        generate_kwargs=generate_kwargs,
+                    )
 
                 # Process chunks/timestamps if available
                 segment_list = []
@@ -974,7 +977,8 @@ class WhisperEngine:
                     logger.info("Running speaker diarization...")
 
                     def _do_diarization():
-                        return self._diarization_pipe(audio_path)
+                        with self._gpu_lock:  # Serialize GPU access
+                            return self._diarization_pipe(audio_path)
 
                     diarization_result = await loop.run_in_executor(None, _do_diarization)
                     has_diarization = True
@@ -1038,6 +1042,7 @@ class LLMAnalysisService:
         self.model = os.environ.get("VLLM_MODEL", "nvidia/Llama-3.1-8B-Instruct-FP4")
         self.ollama_model = settings.ollama_model
         self._use_vllm = None  # Will be determined on first call
+        self._backend_lock = threading.Lock()  # Protects _use_vllm detection
 
     async def _check_vllm(self) -> bool:
         """Check if vLLM is available."""
@@ -1061,13 +1066,17 @@ class LLMAnalysisService:
 
         logger.info(f"Analyzing transcript for department: {department or 'Unknown'}")
 
-        # Determine which backend to use
+        # Determine which backend to use (double-checked locking)
+        # Await happens outside lock to avoid blocking the event loop
         if self._use_vllm is None:
-            self._use_vllm = await self._check_vllm()
-            if self._use_vllm:
-                logger.info("Using vLLM backend for LLM analysis")
-            else:
-                logger.info("Using Ollama backend for LLM analysis")
+            result = await self._check_vllm()
+            with self._backend_lock:
+                if self._use_vllm is None:
+                    self._use_vllm = result
+                    if self._use_vllm:
+                        logger.info("Using vLLM backend for LLM analysis")
+                    else:
+                        logger.info("Using Ollama backend for LLM analysis")
 
         if self._use_vllm:
             return await self._analyze_with_vllm(prompt)

@@ -158,6 +158,12 @@ async def cdr_polling_task():
                         if not recording:
                             continue
 
+                        # Skip if already being processed by another source
+                        from app.services.processing_tracker import get_processing_tracker
+                        if get_processing_tracker().is_processing(call_id):
+                            logger.info(f"CDR poller: skipping {call_id}, already being processed")
+                            continue
+
                         # Process this call
                         new_calls_found += 1
                         logger.info(f"Auto-processing new call: {call_id} ({call_type})")

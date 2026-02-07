@@ -299,6 +299,11 @@ async def _trigger_transcription_processing(call_id: str, recording_file: str):
     Downloads recording, transcribes with Riva NIM, and analyzes with Llama 3 70B.
     """
     from app.routers.transcription import _process_recording_task
+    from app.services.processing_tracker import get_processing_tracker
+
+    if get_processing_tracker().is_processing(call_id):
+        logger.info(f"Webhook: skipping {call_id}, already being processed")
+        return
 
     try:
         # Small delay to ensure recording is fully saved on PBX

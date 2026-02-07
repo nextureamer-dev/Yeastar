@@ -10,12 +10,15 @@ import os
 import httpx
 import logging
 
+from sqlalchemy.exc import IntegrityError
+
 from app.database import get_db
 from app.models.call_summary import CallSummary, SummaryNote
 from app.models.user import User
 from app.services.ai_transcription import get_ai_service
 from app.services.yeastar_client import get_yeastar_client
 from app.services.auth import get_current_user, is_superadmin
+from app.services.processing_tracker import get_processing_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +81,21 @@ async def process_call_recording(
     Processing happens in the background and continues even if the client disconnects.
     When force=true, the existing summary is deleted first for a clean regeneration.
     """
+    tracker = get_processing_tracker()
+
+    # Check if this call is already being processed
+    if tracker.is_processing(call_id):
+        if force:
+            raise HTTPException(
+                status_code=409,
+                detail="Call is currently being processed. Please retry after processing completes."
+            )
+        return {
+            "status": "processing",
+            "message": "This call is already being processed.",
+            "call_id": call_id,
+        }
+
     # Check if already processed
     existing = db.query(CallSummary).filter(CallSummary.call_id == call_id).first()
     if existing and not force:
@@ -1792,6 +1810,13 @@ async def _process_recording_task(
     """Background task to process a recording."""
     from app.database import SessionLocal
 
+    tracker = get_processing_tracker()
+
+    # Atomically check if this call is already being processed
+    if not tracker.try_acquire(call_id):
+        logger.info(f"Call {call_id} is already being processed, skipping duplicate")
+        return
+
     db = SessionLocal()
     try:
         logger.info(f"Processing call {call_id} with recording_file: {recording_file}")
@@ -2133,8 +2158,12 @@ async def _process_recording_task(
                     )
                     db.add(summary)
 
-                db.commit()
-                logger.info(f"Successfully processed call {call_id}")
+                try:
+                    db.commit()
+                    logger.info(f"Successfully processed call {call_id}")
+                except IntegrityError:
+                    db.rollback()
+                    logger.warning(f"IntegrityError for call {call_id} - concurrent insert detected, skipping")
 
                 # Broadcast analytics update via WebSocket
                 try:
@@ -2158,6 +2187,7 @@ async def _process_recording_task(
         logger.error(f"Error processing call {call_id}: {e}")
         _save_error(db, call_id, str(e), recording_file)
     finally:
+        tracker.release(call_id)
         db.close()
 
 
@@ -2173,7 +2203,11 @@ def _save_error(db: Session, call_id: str, error_msg: str, recording_file: str =
             error_message=error_msg,
         )
         db.add(summary)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(f"IntegrityError saving error for call {call_id}, skipping")
 
 
 # ============================================================================

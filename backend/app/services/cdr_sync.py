@@ -172,6 +172,11 @@ class CDRSyncService:
     async def _trigger_ai_processing(self, call_id: str, recording_file: str):
         """Trigger AI processing for a call."""
         from app.routers.transcription import _process_recording_task
+        from app.services.processing_tracker import get_processing_tracker
+
+        if get_processing_tracker().is_processing(call_id):
+            logger.info(f"CDR sync: skipping {call_id}, already being processed")
+            return
 
         try:
             # Small delay to avoid overwhelming the AI service

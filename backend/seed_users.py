@@ -133,6 +133,18 @@ USERS = [
         "is_superadmin": False,
         "role": "employee"
     },
+    # Qualifier Team
+    {
+        "username": "vismaya",
+        "email": "vismaya@yeastar.local",
+        "full_name": "Vismaya",
+        "extension": "221",
+        "department": "Qualifier",
+        "password": "Vismaya@123",
+        "is_admin": False,
+        "is_superadmin": False,
+        "role": "employee"
+    },
 ]
 
 def main():
