@@ -653,7 +653,7 @@ class WhisperEngine:
         self._diarization_loaded = False
         self._loading = False
         self._lock = asyncio.Lock()
-        self._gpu_lock = threading.Lock()  # Serializes GPU inference across threads
+        self._gpu_lock = threading.Semaphore(3)  # Allow up to 3 concurrent GPU inferences
         self._device = None
         self._hf_token = os.environ.get("HF_TOKEN")  # HuggingFace token for pyannote
 
@@ -897,11 +897,11 @@ class WhisperEngine:
                     "Amer Centre, Nexture, GDRFA, ICP, medical fitness, typing services."
                 )
 
-                with self._gpu_lock:  # Serialize GPU inference across threads
+                with self._gpu_lock:  # Up to 3 concurrent GPU inferences
                     result = self._pipe(
                         audio_path,
                         chunk_length_s=30,
-                        batch_size=16,  # Reduced for better accuracy
+                        batch_size=48,  # Larger batch for 120GB VRAM
                         return_timestamps=True,
                         generate_kwargs=generate_kwargs,
                     )
