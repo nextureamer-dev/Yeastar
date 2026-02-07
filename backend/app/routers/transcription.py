@@ -11,7 +11,7 @@ import httpx
 import logging
 
 from app.database import get_db
-from app.models.call_summary import CallSummary
+from app.models.call_summary import CallSummary, SummaryNote
 from app.models.user import User
 from app.services.ai_transcription import get_ai_service
 from app.services.yeastar_client import get_yeastar_client
@@ -74,6 +74,9 @@ async def process_call_recording(
 
     This downloads the recording from Yeastar, transcribes it with NVIDIA Riva NIM,
     and generates a detailed analysis using Llama 3 70B.
+
+    Processing happens in the background and continues even if the client disconnects.
+    When force=true, the existing summary is deleted first for a clean regeneration.
     """
     # Check if already processed
     existing = db.query(CallSummary).filter(CallSummary.call_id == call_id).first()
@@ -82,6 +85,14 @@ async def process_call_recording(
             "status": "already_processed",
             "summary": existing.to_dict()
         }
+
+    # If force regeneration, delete the existing summary for a clean start
+    if existing and force:
+        logger.info(f"Force regeneration requested for call {call_id}, deleting existing summary")
+        # Also delete associated notes
+        db.query(SummaryNote).filter(SummaryNote.call_id == call_id).delete()
+        db.query(CallSummary).filter(CallSummary.call_id == call_id).delete()
+        db.commit()
 
     # Queue for background processing
     background_tasks.add_task(
@@ -93,7 +104,7 @@ async def process_call_recording(
 
     return {
         "status": "processing",
-        "message": "Recording queued for transcription and summarization",
+        "message": "Recording queued for transcription and summarization. Processing continues in background.",
         "call_id": call_id
     }
 
