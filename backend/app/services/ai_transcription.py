@@ -184,12 +184,29 @@ The recording filename format includes the extension: e.g., "20251211-201-Outbou
 ═══════════════════════════════════════════════════════════════════════════════
 SPEAKER IDENTIFICATION RULES:
 ═══════════════════════════════════════════════════════════════════════════════
-- If transcript has speaker labels (SPEAKER_00, SPEAKER_01, etc.), SPEAKER_00 is typically the person who answered (STAFF)
+CRITICAL - Use CALL DIRECTION from Recording Context to determine roles:
+
+**INBOUND calls (Customer called in):**
+- SPEAKER_00 is typically STAFF (the person who answered the phone)
+- SPEAKER_01 is typically CUSTOMER (the person who called in)
+- The person greeting with company name ("Good morning, Amer Centre") is STAFF
+- The person asking about services is CUSTOMER
+
+**OUTBOUND calls (Staff initiated the call to a client/prospect):**
+- SPEAKER_00 is typically STAFF (the person who made the call)
+- SPEAKER_01 is typically the CLIENT/CUSTOMER (the person who answered)
+- The person introducing themselves as calling from Nexture/Amer Centre is STAFF
+- The person being called/pitched/qualified is the CUSTOMER/CLIENT
+- IMPORTANT: In outbound qualifier/sales calls, STAFF is the one asking questions, probing requirements, and qualifying the lead. The CUSTOMER is the one being asked questions and responding. Do NOT confuse the qualifier asking questions with being the customer.
+
+**INTERNAL calls:**
+- Both speakers are STAFF members
+
+**General rules (apply after direction-based rules):**
 - If someone greets with "Good morning/afternoon, Amer Centre" or company name, they are STAFF
-- If someone asks about visa/Emirates ID/company setup services, they are CUSTOMER
-- The person providing information/solutions is STAFF
-- The person asking questions/requesting services is CUSTOMER
 - Match staff names from the extension directory if identifiable
+- The company context in Recording Context identifies which company the STAFF belongs to - the other party is the CUSTOMER/CLIENT
+- NEVER label the staff member's own company as the customer's company
 
 ═══════════════════════════════════════════════════════════════════════════════
 TRANSCRIPT:
@@ -208,7 +225,7 @@ COMPREHENSIVE ANALYSIS - Return JSON:
     "call_type": "visa_inquiry|emirates_id|attestation|company_setup|trade_license|golden_visa|green_visa|follow_up|complaint|consultation|support|general_inquiry|otp_verification|appointment_booking|status_check|document_collection|payment_inquiry|callback_request|internal|spam|wrong_number|other",
     "service_category": "Amer Centre Services|Nexture Corporate Services|Both|Unknown",
     "service_subcategory": "Specific service like 'Golden Visa', 'Trade License Renewal', 'Emirates ID Status', etc.",
-    "summary": "2-3 sentence summary: What did CUSTOMER want? How did STAFF help? What was the outcome?",
+    "summary": "2-3 sentence summary: Use Call Direction to determine who initiated. For OUTBOUND calls: 'Staff [name] from [company] called [customer/client] to [purpose]'. For INBOUND calls: 'Customer called [company] to [purpose]'. Include the actual outcome (e.g., 'customer disconnected', 'call was too short for discussion', 'requirements were discussed').",
 
     "staff_name": "Name of staff member (use extension directory if identifiable), otherwise null",
     "staff_extension": "Extension number if identifiable from recording or conversation, otherwise null",
@@ -339,7 +356,11 @@ CRITICAL RULES:
 4. DEDUPLICATION: If a number/name is repeated for confirmation, count it ONCE only
 5. OTP CALLS: If the call is primarily about OTP verification, mark call_type as "otp_verification"
 6. Be SPECIFIC about services: "Golden Visa inquiry for property investment" not just "visa inquiry"
-7. MOOD ANALYSIS: Base mood assessment on actual tone indicators (urgency words, politeness, complaints, thanks)
+7. MOOD ANALYSIS: Base mood assessment on actual tone indicators (urgency words, politeness, complaints, thanks).
+   - If the call is very short (under 1 minute of actual conversation), has minimal back-and-forth, or the customer disconnected/hung up mid-call, sentiment should be "neutral" or "negative" - NEVER "positive"
+   - Do NOT mark sentiment as "positive" just because staff greeted politely if no real conversation happened
+   - If the customer disconnected before discussion could happen, mark overall_sentiment as "negative" or "neutral" and note "customer_disconnected" in frustration_indicators
+   - "positive" sentiment requires actual positive indicators: customer expressed satisfaction, thanked staff, agreed to proceed, or showed genuine interest
 8. EMPLOYEE PERFORMANCE: Be objective and constructive - provide actionable feedback
 9. SALES OPPORTUNITIES: Identify potential business opportunities and qualify leads
 10. STAFF IDENTIFICATION: Use extension directory to identify staff when possible
@@ -356,7 +377,9 @@ QUALIFIER_PROMPT_TEMPLATE = """
 QUALIFIER DEPARTMENT ANALYSIS - ADDITIONAL FIELDS REQUIRED:
 ═══════════════════════════════════════════════════════════════════════════════
 
-The staff member handling this call is from the QUALIFIER department. Analyze the call for lead qualification with these specific criteria:
+The staff member handling this call is from the QUALIFIER department.
+IMPORTANT: In qualifier calls, the STAFF (Qualifier Agent) typically makes OUTBOUND calls to prospects/clients to qualify leads. The Qualifier Agent is the one ASKING questions, probing requirements, and assessing the lead. The person BEING CALLED is the CLIENT/CUSTOMER - they are the prospect being qualified. Do NOT confuse the qualifier's company (Nexture Corporate Services) with the customer's company.
+Analyze the call for lead qualification with these specific criteria:
 
 **5 MANDATORY QUALIFICATION FIELDS TO DETECT:**
 1. **Service Name** - The EXACT service mentioned (not generic like "just checking" or "need information")
@@ -1348,10 +1371,12 @@ class AITranscriptionService:
             # Extract direction
             if "Outbound" in filename or "outbound" in filename:
                 call_direction = "outbound"
-                recording_context += f"\nCall Direction: Outbound (Staff initiated the call)"
+                staff_label = staff_info.get('name', 'Staff')
+                dept_label = staff_info.get('department', 'Unknown')
+                recording_context += f"\nCall Direction: Outbound (Staff '{staff_label}' from '{dept_label}' department initiated this call TO a client/prospect. The OTHER person on the call is the CUSTOMER/CLIENT being contacted.)"
             elif "Inbound" in filename or "inbound" in filename:
                 call_direction = "inbound"
-                recording_context += f"\nCall Direction: Inbound (Customer called in)"
+                recording_context += f"\nCall Direction: Inbound (Customer called in to our office. Staff answered the call.)"
             elif "Internal" in filename or "internal" in filename:
                 call_direction = "internal"
                 recording_context += f"\nCall Direction: Internal (Call between staff members)"

@@ -2,6 +2,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: yeastar-mysql
+    restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: yeastar_root_2024
       MYSQL_DATABASE: yeastar_crm
@@ -21,6 +22,7 @@ services:
   ai-transcription:
     image: nvcr.io/nvidia/pytorch:25.11-py3
     container_name: yeastar-ai
+    restart: unless-stopped
     network_mode: host
     depends_on:
       mysql:
