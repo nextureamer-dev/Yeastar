@@ -567,26 +567,35 @@ async def get_staff_call_metrics(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Get per-staff call counts (inbound + outbound) and pending AI summary counts.
-    Max 7 day range.
+    Get per-staff call counts, missed calls, duration, answer rate, and pending AI summary counts.
+    Max 7 day range. 'Today' (days=1) uses start of day, not last 24 hours.
     """
     from app.models.call_log import CallLog, CallDirection, CallStatus
 
+    # Non-superadmin users can only see their own metrics
+    user_extension = None
     if not is_superadmin(current_user):
-        raise HTTPException(status_code=403, detail="Superadmin access required")
+        if not current_user.extension:
+            raise HTTPException(status_code=400, detail="No extension assigned to your account")
+        user_extension = current_user.extension
 
-    cutoff_date = datetime.now() - timedelta(days=days)
+    # For days=1 ("Today"), use start of today; otherwise go back N days from now
+    if days == 1:
+        cutoff_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        cutoff_date = datetime.now() - timedelta(days=days)
 
-    # Get all answered calls with recordings in date range
+    # Get ALL calls (not just answered) in date range — need missed calls + duration
     calls = db.query(
         CallLog.call_id,
         CallLog.direction,
+        CallLog.status,
         CallLog.caller_number,
         CallLog.callee_number,
         CallLog.extension,
+        CallLog.duration,
     ).filter(
         CallLog.start_time >= cutoff_date,
-        CallLog.status == CallStatus.ANSWERED,
     ).all()
 
     # Get set of call IDs that already have AI summaries
@@ -597,8 +606,11 @@ async def get_staff_call_metrics(
     processed_call_ids = {s.call_id for s in existing_summaries}
 
     # Build per-staff metrics using STAFF_DIRECTORY extensions
+    # If non-superadmin, only include their own extension
     staff_metrics = {}
     for ext, info in STAFF_DIRECTORY.items():
+        if user_extension and ext != user_extension:
+            continue
         staff_metrics[ext] = {
             "extension": ext,
             "name": info["name"],
@@ -607,26 +619,39 @@ async def get_staff_call_metrics(
             "outbound": 0,
             "internal": 0,
             "total_calls": 0,
+            "answered": 0,
+            "missed": 0,
+            "total_duration": 0,
+            "inbound_answered": 0,
             "pending_summary": 0,
         }
 
-    for call_id, direction, caller, callee, ext_field in calls:
+    # Track answered inbound calls for round-robin dedup
+    answered_inbound_by_caller = {}  # normalized_caller -> list of call start times
+    missed_inbound_records = []  # (matched_ext, normalized_caller, call_id)
+
+    def _normalize_phone(num):
+        return num.replace('+971', '0').replace('+', '') if num else ''
+
+    for call_id, direction, status, caller, callee, ext_field, duration in calls:
         # Determine which staff extension this call belongs to
         matched_ext = None
         if ext_field and ext_field in STAFF_DIRECTORY:
             matched_ext = ext_field
         else:
-            # Check caller/callee against known extensions
             for known_ext in STAFF_DIRECTORY:
                 if caller == known_ext or callee == known_ext:
                     matched_ext = known_ext
                     break
 
-        if not matched_ext:
+        if not matched_ext or matched_ext not in staff_metrics:
             continue
 
         metrics = staff_metrics[matched_ext]
         dir_str = direction.value if hasattr(direction, 'value') else str(direction)
+        status_str = status.value if hasattr(status, 'value') else str(status)
+
+        # Count by direction (all calls)
         if dir_str == 'inbound':
             metrics["inbound"] += 1
         elif dir_str == 'outbound':
@@ -635,16 +660,73 @@ async def get_staff_call_metrics(
             metrics["internal"] += 1
         metrics["total_calls"] += 1
 
-        # Check if this call has a pending AI summary (has recording but no summary)
-        if call_id not in processed_call_ids:
+        # Count answered vs missed
+        if status_str == 'answered':
+            metrics["answered"] += 1
+            metrics["total_duration"] += (duration or 0)
+
+            # Track inbound answered for answer rate + round-robin dedup
+            if dir_str == 'inbound':
+                metrics["inbound_answered"] += 1
+                norm_caller = _normalize_phone(caller)
+                if norm_caller not in answered_inbound_by_caller:
+                    answered_inbound_by_caller[norm_caller] = True
+        elif status_str in ('no_answer', 'missed', 'voicemail', 'busy'):
+            # Only count inbound missed calls (not outbound no-answer or internal)
+            if dir_str == 'inbound':
+                metrics["missed"] += 1
+                missed_inbound_records.append((matched_ext, _normalize_phone(caller)))
+
+        # Check if this call has a pending AI summary
+        if status_str == 'answered' and call_id not in processed_call_ids:
             metrics["pending_summary"] += 1
 
-    # Convert to list, sorted by total calls desc
-    result = sorted(staff_metrics.values(), key=lambda x: x["total_calls"], reverse=True)
+    # Round-robin dedup: subtract missed inbound calls where same caller was answered
+    for matched_ext, norm_caller in missed_inbound_records:
+        if norm_caller in answered_inbound_by_caller:
+            staff_metrics[matched_ext]["missed"] = max(0, staff_metrics[matched_ext]["missed"] - 1)
+
+    # Calculate answer_rate (inbound only) and avg_duration, then build result
+    total_inbound_answered = 0
+    total_inbound_missed = 0
+    result = []
+    for m in staff_metrics.values():
+        # Answer rate = inbound answered / (inbound answered + inbound missed)
+        # null when staff has no inbound calls at all
+        inbound_total = m["inbound_answered"] + m["missed"]
+        m["answer_rate"] = round(m["inbound_answered"] / inbound_total * 100, 1) if inbound_total > 0 else None
+        m["avg_duration"] = round(m["total_duration"] / m["answered"], 1) if m["answered"] > 0 else 0
+        total_inbound_answered += m["inbound_answered"]
+        total_inbound_missed += m["missed"]
+        del m["total_duration"]
+        del m["inbound_answered"]
+        result.append(m)
+
+    result.sort(key=lambda x: x["total_calls"], reverse=True)
+
+    # Also compute overall totals for the summary
+    overall = {
+        "total_calls": sum(m["total_calls"] for m in result),
+        "answered": sum(m["answered"] for m in result),
+        "missed": sum(m["missed"] for m in result),
+        "inbound": sum(m["inbound"] for m in result),
+        "outbound": sum(m["outbound"] for m in result),
+        "internal": sum(m["internal"] for m in result),
+        "avg_duration": 0,
+        "answer_rate": 0,
+    }
+    total_dur = sum(m["avg_duration"] * m["answered"] for m in result)
+    if overall["answered"] > 0:
+        overall["avg_duration"] = round(total_dur / overall["answered"], 1)
+    # Answer rate based on inbound only
+    overall_inbound_total = total_inbound_answered + total_inbound_missed
+    if overall_inbound_total > 0:
+        overall["answer_rate"] = round(total_inbound_answered / overall_inbound_total * 100, 1)
 
     return {
         "period_days": days,
         "staff_metrics": result,
+        "overall": overall,
     }
 
 
@@ -3076,6 +3158,94 @@ async def get_star_rating_distribution(
         "overall_average": round(sum(c.star_rating for c in calls) / len(calls), 2) if calls else 0,
         "by_department": by_department,
         "by_staff": by_staff,
+    }
+
+
+@router.get("/calls-by-star-rating")
+async def get_calls_by_star_rating(
+    rating: int = Query(..., ge=1, le=5, description="Star rating to filter by (1-5)"),
+    department: Optional[str] = Query(None, description="Department filter"),
+    days: int = Query(30, ge=1, le=90),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get individual calls filtered by star rating, with optional department filter."""
+    from app.models.call_log import CallLog
+
+    if not is_superadmin(current_user):
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+
+    cutoff = datetime.now() - timedelta(days=days)
+
+    # Build department extension set if filtering by department
+    dept_extensions = None
+    if department:
+        dept_extensions = {ext for ext, info in STAFF_DIRECTORY.items() if info["department"] == department}
+        if not dept_extensions:
+            return {"rating": rating, "department": department, "period_days": days,
+                    "total": 0, "page": page, "total_pages": 0, "calls": []}
+
+    # Query call_summaries joined with call_logs
+    query = db.query(
+        CallSummary.call_id,
+        CallSummary.star_rating,
+        CallSummary.star_rating_justification,
+        CallSummary.summary,
+        CallSummary.call_type,
+        CallSummary.sentiment,
+        CallLog.extension,
+        CallLog.start_time,
+        CallLog.duration,
+        CallLog.direction,
+        CallLog.caller_number,
+        CallLog.callee_number,
+    ).join(
+        CallLog, CallSummary.call_id == CallLog.call_id
+    ).filter(
+        CallSummary.star_rating == rating,
+        CallLog.start_time >= cutoff,
+        CallSummary.error_message.is_(None),
+    )
+
+    if dept_extensions:
+        query = query.filter(CallLog.extension.in_(dept_extensions))
+
+    total = query.count()
+    total_pages = (total + per_page - 1) // per_page
+
+    rows = query.order_by(CallLog.start_time.desc()).offset((page - 1) * per_page).limit(per_page).all()
+
+    calls = []
+    for row in rows:
+        ext = row.extension or ""
+        staff_info = STAFF_DIRECTORY.get(ext, {})
+        calls.append({
+            "call_id": row.call_id,
+            "star_rating": row.star_rating,
+            "star_rating_justification": row.star_rating_justification,
+            "summary": row.summary,
+            "call_type": row.call_type,
+            "sentiment": row.sentiment,
+            "staff_name": staff_info.get("name", "Unknown"),
+            "staff_extension": ext,
+            "department": staff_info.get("department", "Unknown"),
+            "start_time": row.start_time.isoformat() if row.start_time else None,
+            "duration": row.duration or 0,
+            "direction": row.direction.value if hasattr(row.direction, 'value') else str(row.direction) if row.direction else "unknown",
+            "caller_number": row.caller_number,
+            "callee_number": row.callee_number,
+        })
+
+    return {
+        "rating": rating,
+        "department": department,
+        "period_days": days,
+        "total": total,
+        "page": page,
+        "total_pages": total_pages,
+        "calls": calls,
     }
 
 
