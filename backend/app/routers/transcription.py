@@ -19,6 +19,7 @@ from app.services.ai_transcription import get_ai_service
 from app.services.yeastar_client import get_yeastar_client
 from app.services.auth import get_current_user, is_superadmin
 from app.services.processing_tracker import get_processing_tracker
+from app.services.processing_queue import get_processing_queue
 
 logger = logging.getLogger(__name__)
 
@@ -67,21 +68,19 @@ async def get_ai_status():
 @router.post("/process/{call_id}")
 async def process_call_recording(
     call_id: str,
-    background_tasks: BackgroundTasks,
     force: bool = Query(False, description="Force reprocess even if summary exists"),
     recording_file: Optional[str] = Query(None, description="Recording filename from Yeastar"),
     db: Session = Depends(get_db),
 ):
     """
-    Process a call recording: transcribe and summarize.
+    Process a call recording: add to processing queue.
 
-    This downloads the recording from Yeastar, transcribes it with NVIDIA Riva NIM,
-    and generates a detailed analysis using Llama 3 70B.
-
-    Processing happens in the background and continues even if the client disconnects.
+    The recording is queued for sequential processing (transcription + AI analysis).
+    Failed items automatically retry up to 3 times with exponential backoff.
     When force=true, the existing summary is deleted first for a clean regeneration.
     """
     tracker = get_processing_tracker()
+    queue = get_processing_queue()
 
     # Check if this call is already being processed
     if tracker.is_processing(call_id):
@@ -107,23 +106,18 @@ async def process_call_recording(
     # If force regeneration, delete the existing summary for a clean start
     if existing and force:
         logger.info(f"Force regeneration requested for call {call_id}, deleting existing summary")
-        # Also delete associated notes
         db.query(SummaryNote).filter(SummaryNote.call_id == call_id).delete()
         db.query(CallSummary).filter(CallSummary.call_id == call_id).delete()
         db.commit()
 
-    # Queue for background processing
-    background_tasks.add_task(
-        _process_recording_task,
-        call_id=call_id,
-        recording_file=recording_file,
-        force=force,
-    )
+    # Add to processing queue
+    result = await queue.add(call_id=call_id, recording_file=recording_file, force=force)
 
     return {
-        "status": "processing",
-        "message": "Recording queued for transcription and summarization. Processing continues in background.",
-        "call_id": call_id
+        "status": "queued",
+        "message": "Recording added to processing queue.",
+        "call_id": call_id,
+        "queue_position": result.get("position", 0),
     }
 
 
@@ -207,6 +201,28 @@ async def get_call_summary(
         result["call_direction"] = None
         result["call_start_time"] = None
 
+    # Always provide call_time - use CallLog start_time, or parse from call_id
+    if call_log and call_log.start_time:
+        result["call_time"] = call_log.start_time.isoformat()
+    else:
+        parsed_time = CallSummary.parse_call_time_from_id(summary.call_id)
+        result["call_time"] = parsed_time.isoformat() if parsed_time else None
+
+    return result
+
+
+@router.get("/queue/status")
+async def get_queue_status():
+    """Get current processing queue status."""
+    queue = get_processing_queue()
+    return queue.get_status()
+
+
+@router.post("/queue/clear")
+async def clear_queue():
+    """Clear all pending items from the processing queue."""
+    queue = get_processing_queue()
+    result = await queue.clear()
     return result
 
 
@@ -216,6 +232,9 @@ async def list_summaries(
     per_page: int = Query(20, ge=1, le=100),
     call_type: Optional[str] = Query(None),
     sentiment: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Search by customer name, staff name, summary text, or call ID"),
+    staff: Optional[str] = Query(None, description="Filter by staff name"),
+    has_feedback: Optional[str] = Query(None, description="Filter by feedback: 'yes' or 'no'"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -262,9 +281,35 @@ async def list_summaries(
         )
 
     if call_type:
-        query = query.filter(CallSummary.call_type == call_type)
+        # Support partial matching for call type (e.g., "inquiry" matches "visa_inquiry", "general_inquiry")
+        query = query.filter(CallSummary.call_type.contains(call_type))
     if sentiment:
         query = query.filter(CallSummary.sentiment == sentiment)
+
+    # Server-side search across multiple fields
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            or_(
+                CallSummary.customer_name.ilike(search_term),
+                CallSummary.staff_name.ilike(search_term),
+                CallSummary.summary.ilike(search_term),
+                CallSummary.call_id.ilike(search_term),
+                CallSummary.customer_phone.ilike(search_term),
+                CallSummary.call_type.ilike(search_term),
+                CallSummary.company_name.ilike(search_term),
+            )
+        )
+
+    # Server-side staff filter
+    if staff:
+        query = query.filter(CallSummary.staff_name == staff)
+
+    # Server-side feedback filter
+    if has_feedback == 'yes':
+        query = query.filter(CallSummary.feedback_rating.isnot(None))
+    elif has_feedback == 'no':
+        query = query.filter(CallSummary.feedback_rating.is_(None))
 
     # Count total - need a separate query that includes the CallLog join for extension matching
     count_query = db.query(func.count(CallSummary.id)).outerjoin(
@@ -296,9 +341,28 @@ async def list_summaries(
             )
         )
     if call_type:
-        count_query = count_query.filter(CallSummary.call_type == call_type)
+        count_query = count_query.filter(CallSummary.call_type.contains(call_type))
     if sentiment:
         count_query = count_query.filter(CallSummary.sentiment == sentiment)
+    if search:
+        search_term = f"%{search}%"
+        count_query = count_query.filter(
+            or_(
+                CallSummary.customer_name.ilike(search_term),
+                CallSummary.staff_name.ilike(search_term),
+                CallSummary.summary.ilike(search_term),
+                CallSummary.call_id.ilike(search_term),
+                CallSummary.customer_phone.ilike(search_term),
+                CallSummary.call_type.ilike(search_term),
+                CallSummary.company_name.ilike(search_term),
+            )
+        )
+    if staff:
+        count_query = count_query.filter(CallSummary.staff_name == staff)
+    if has_feedback == 'yes':
+        count_query = count_query.filter(CallSummary.feedback_rating.isnot(None))
+    elif has_feedback == 'no':
+        count_query = count_query.filter(CallSummary.feedback_rating.is_(None))
     total_count = count_query.scalar()
 
     # Order by call time (from CallLog) if available, otherwise by summary created_at
@@ -310,14 +374,28 @@ async def list_summaries(
     summaries_data = []
     for summary, call_time in results:
         summary_dict = summary.to_dict()
-        summary_dict["call_time"] = call_time.isoformat() if call_time else None
+        # Use CallLog start_time if available, otherwise parse from call_id
+        if call_time:
+            summary_dict["call_time"] = call_time.isoformat()
+        else:
+            parsed_time = CallSummary.parse_call_time_from_id(summary.call_id)
+            summary_dict["call_time"] = parsed_time.isoformat() if parsed_time else None
         summaries_data.append(summary_dict)
+
+    # Get unique staff names for filter dropdown
+    staff_names = db.query(CallSummary.staff_name).filter(
+        CallSummary.error_message.is_(None),
+        CallSummary.summary.isnot(None),
+        CallSummary.staff_name.isnot(None),
+    ).distinct().all()
+    staff_list = sorted([s[0] for s in staff_names if s[0]])
 
     return {
         "summaries": summaries_data,
         "total": total_count,
         "page": page,
         "per_page": per_page,
+        "staff_list": staff_list,
     }
 
 
@@ -482,6 +560,94 @@ async def _get_pending_stats_from_api(days: int, db, current_user):
     }
 
 
+@router.get("/staff-call-metrics")
+async def get_staff_call_metrics(
+    days: int = Query(7, ge=1, le=7, description="Number of days (max 7)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get per-staff call counts (inbound + outbound) and pending AI summary counts.
+    Max 7 day range.
+    """
+    from app.models.call_log import CallLog, CallDirection, CallStatus
+
+    if not is_superadmin(current_user):
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    # Get all answered calls with recordings in date range
+    calls = db.query(
+        CallLog.call_id,
+        CallLog.direction,
+        CallLog.caller_number,
+        CallLog.callee_number,
+        CallLog.extension,
+    ).filter(
+        CallLog.start_time >= cutoff_date,
+        CallLog.status == CallStatus.ANSWERED,
+    ).all()
+
+    # Get set of call IDs that already have AI summaries
+    existing_summaries = db.query(CallSummary.call_id).filter(
+        CallSummary.error_message.is_(None),
+        CallSummary.summary.isnot(None),
+    ).all()
+    processed_call_ids = {s.call_id for s in existing_summaries}
+
+    # Build per-staff metrics using STAFF_DIRECTORY extensions
+    staff_metrics = {}
+    for ext, info in STAFF_DIRECTORY.items():
+        staff_metrics[ext] = {
+            "extension": ext,
+            "name": info["name"],
+            "department": info["department"],
+            "inbound": 0,
+            "outbound": 0,
+            "internal": 0,
+            "total_calls": 0,
+            "pending_summary": 0,
+        }
+
+    for call_id, direction, caller, callee, ext_field in calls:
+        # Determine which staff extension this call belongs to
+        matched_ext = None
+        if ext_field and ext_field in STAFF_DIRECTORY:
+            matched_ext = ext_field
+        else:
+            # Check caller/callee against known extensions
+            for known_ext in STAFF_DIRECTORY:
+                if caller == known_ext or callee == known_ext:
+                    matched_ext = known_ext
+                    break
+
+        if not matched_ext:
+            continue
+
+        metrics = staff_metrics[matched_ext]
+        dir_str = direction.value if hasattr(direction, 'value') else str(direction)
+        if dir_str == 'inbound':
+            metrics["inbound"] += 1
+        elif dir_str == 'outbound':
+            metrics["outbound"] += 1
+        elif dir_str == 'internal':
+            metrics["internal"] += 1
+        metrics["total_calls"] += 1
+
+        # Check if this call has a pending AI summary (has recording but no summary)
+        if call_id not in processed_call_ids:
+            metrics["pending_summary"] += 1
+
+    # Convert to list, sorted by total calls desc
+    result = sorted(staff_metrics.values(), key=lambda x: x["total_calls"], reverse=True)
+
+    return {
+        "period_days": days,
+        "staff_metrics": result,
+    }
+
+
 @router.get("/analytics")
 async def get_call_analytics(
     days: int = Query(30, ge=1, le=365, description="Number of days to analyze"),
@@ -588,9 +754,12 @@ async def get_language_analytics(
     total_with_language = sum(count for _, count in language_counts)
 
     # Build distribution with percentages
+    # Invalid/ambiguous language codes to exclude
+    invalid_langs = {'auto', 'unknown', '', 'it', 'it/cy', 'cy'}
+
     language_distribution = {}
     for lang, count in language_counts:
-        if lang and lang.lower() not in ['auto', 'unknown', '']:
+        if lang and lang.lower() not in invalid_langs and '/' not in lang and ',' not in lang:
             percentage = round((count / total_with_language * 100), 1) if total_with_language > 0 else 0
             language_distribution[lang] = {
                 "count": count,
@@ -612,7 +781,7 @@ async def get_language_analytics(
     # Build language-sentiment matrix
     lang_sentiment_matrix = {}
     for lang, sentiment, count in language_sentiment:
-        if lang and lang.lower() not in ['auto', 'unknown', '']:
+        if lang and lang.lower() not in invalid_langs and '/' not in lang and ',' not in lang:
             if lang not in lang_sentiment_matrix:
                 lang_sentiment_matrix[lang] = {"positive": 0, "neutral": 0, "negative": 0}
             if sentiment in lang_sentiment_matrix[lang]:
@@ -633,7 +802,7 @@ async def get_language_analytics(
     # Build language-call_type matrix
     lang_call_type_matrix = {}
     for lang, call_type, count in language_call_type:
-        if lang and lang.lower() not in ['auto', 'unknown', '']:
+        if lang and lang.lower() not in invalid_langs and '/' not in lang and ',' not in lang:
             if lang not in lang_call_type_matrix:
                 lang_call_type_matrix[lang] = {}
             lang_call_type_matrix[lang][call_type] = count
@@ -1493,14 +1662,14 @@ Return ONLY valid JSON, no other text."""
 
 @router.post("/batch-process")
 async def batch_process_recordings(
-    background_tasks: BackgroundTasks,
     limit: int = Query(10, ge=1, le=50, description="Number of recordings to process"),
     db: Session = Depends(get_db),
 ):
     """
-    Process multiple unprocessed recordings in batch.
+    Batch queue unprocessed recordings for processing.
 
-    Fetches recent calls with recordings and processes any that don't have summaries.
+    Fetches recent calls with recordings and queues any that don't have summaries.
+    Items are processed sequentially with automatic retry on failure.
     """
     # Get recent calls with recordings from Yeastar
     client = get_yeastar_client()
@@ -1513,20 +1682,17 @@ async def batch_process_recordings(
 
     # Filter calls with recordings that haven't been processed
     to_process = []
-    seen_call_ids = set()  # Prevent duplicates
+    seen_call_ids = set()
 
     for cdr in cdrs:
-        # CDR uses "recording" field, not "record_file"
         recording = cdr.get("recording") or cdr.get("record_file")
         call_id = cdr.get("uid")
 
-        # Skip if no recording, no call_id, or already seen
         if not recording or not call_id or call_id in seen_call_ids:
             continue
 
         seen_call_ids.add(call_id)
 
-        # Skip if already processed
         existing = db.query(CallSummary).filter(CallSummary.call_id == call_id).first()
         if not existing:
             to_process.append({
@@ -1537,19 +1703,15 @@ async def batch_process_recordings(
         if len(to_process) >= limit:
             break
 
-    # Queue all for processing
-    for item in to_process:
-        background_tasks.add_task(
-            _process_recording_task,
-            call_id=item["call_id"],
-            recording_file=item["recording_file"],
-            force=False,
-        )
+    # Add all to processing queue
+    queue = get_processing_queue()
+    batch_result = await queue.add_batch(to_process)
 
     return {
         "status": "queued",
-        "count": len(to_process),
-        "call_ids": [item["call_id"] for item in to_process]
+        "count": batch_result["added_count"],
+        "skipped": batch_result["skipped_count"],
+        "call_ids": batch_result["added"],
     }
 
 
@@ -1821,6 +1983,15 @@ async def _process_recording_task(
     try:
         logger.info(f"Processing call {call_id} with recording_file: {recording_file}")
 
+        # Stage tracking via processing queue
+        from app.services.processing_queue import get_processing_queue
+        queue = get_processing_queue()
+
+        async def _stage_callback(stage: str):
+            await queue.update_stage(call_id, stage)
+
+        await queue.update_stage(call_id, "downloading")
+
         # Get recording file from Yeastar's recording list API
         if not recording_file:
             client = get_yeastar_client()
@@ -1871,9 +2042,10 @@ async def _process_recording_task(
         try:
             # Process with AI
             ai_service = get_ai_service()
-            result = await ai_service.process_recording(temp_path, recording_file=recording_file)
+            result = await ai_service.process_recording(temp_path, recording_file=recording_file, stage_callback=_stage_callback)
 
             # Save to database
+            await queue.update_stage(call_id, "saving")
             if result.get("success"):
                 summary_data = result.get("summary", {}) or {}
 
@@ -1917,6 +2089,12 @@ async def _process_recording_task(
                 staff_extension = result.get("staff_extension") or summary_data.get("staff_extension")
                 staff_name = result.get("staff_name") or summary_data.get("staff_name")
                 staff_department = result.get("staff_department") or summary_data.get("staff_department")
+
+                # Override with STAFF_DIRECTORY if extension is known (AI may extract role as name)
+                if staff_extension and staff_extension in STAFF_DIRECTORY:
+                    staff_info = STAFF_DIRECTORY[staff_extension]
+                    staff_name = staff_info["name"]
+                    staff_department = staff_info["department"]
 
                 # ==================== EXTRACT DEPARTMENT-SPECIFIC ANALYSIS ====================
                 dept_analysis = summary_data.get("department_analysis", {}) or {}

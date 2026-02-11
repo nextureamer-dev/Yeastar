@@ -47,7 +47,7 @@ services:
       - YEASTAR_CLIENT_SECRET=EoOKDu8qNGLljq4sfscE8096Zv5tYH6X
       # Whisper model: use "openai/whisper-large-v3" for best multilingual accuracy
       # or "openai/whisper-large-v3-turbo" for faster but less accurate transcription
-      - WHISPER_MODEL=openai/whisper-large-v3
+      - WHISPER_MODEL=openai/whisper-large-v3-turbo
       - AUTO_PROCESS_CALLS=false
     volumes:
       - ./backend:/workspace/backend

@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from datetime import datetime
 import httpx
 
@@ -234,11 +234,11 @@ COMPREHENSIVE ANALYSIS - Return JSON:
     "customer_phone": "Customer's phone number if mentioned, formatted as +971-XX-XXX-XXXX",
     "company_name": "Customer's company name if mentioned (for corporate clients), otherwise null",
 
-    "topics_discussed": ["List specific topics: e.g., 'Golden Visa eligibility', 'Trade license amendment process', 'Emirates ID renewal documents required'"],
-    "customer_requests": ["Specific requests: e.g., 'Check visa status for application #12345', 'Get quote for mainland company setup', 'Schedule appointment for biometrics'"],
-    "staff_responses": ["How staff addressed each request with specific details provided"],
-    "action_items": ["Follow-up actions with owner: e.g., 'Customer to send passport copy on WhatsApp', 'Staff to email quotation', 'Customer to visit branch on Monday'"],
-    "commitments_made": ["Promises made by staff: e.g., 'Will call back within 2 hours', 'Will send documents by email today'"],
+    "topics_discussed": ["List ONLY topics actually discussed in the transcript - use empty array [] if none"],
+    "customer_requests": ["List ONLY requests the customer actually made in the transcript - use empty array [] if none"],
+    "staff_responses": ["List ONLY actual responses staff gave in the transcript - NEVER fabricate or assume responses"],
+    "action_items": ["List ONLY action items explicitly agreed upon or stated in the transcript - NEVER invent action items. Use empty array [] if no action items were discussed"],
+    "commitments_made": ["List ONLY promises actually made during the call - NEVER fabricate commitments. Use empty array [] if none"],
 
     "resolution_status": "resolved|pending|escalated|requires_followup|transferred|callback_scheduled|unclear",
 
@@ -345,27 +345,38 @@ COMPREHENSIVE ANALYSIS - Return JSON:
 }}
 
 ═══════════════════════════════════════════════════════════════════════════════
-CRITICAL RULES:
+CRITICAL RULES - READ CAREFULLY:
 ═══════════════════════════════════════════════════════════════════════════════
-1. ONLY include information ACTUALLY said in the transcript - do not assume or fabricate
-2. If something wasn't mentioned, use null or empty array []
-3. PHONE NUMBER FORMAT:
+
+*** ANTI-HALLUCINATION RULES (HIGHEST PRIORITY) ***
+A. NEVER fabricate, invent, or assume information not explicitly stated in the transcript.
+B. For action_items: ONLY include actions that were explicitly agreed upon or stated during the call. If no action items were discussed, return an empty array []. Do NOT invent generic action items like sending documents or visiting branches unless the transcript explicitly says so.
+C. For staff_responses: ONLY include what the staff member actually said in the transcript. Do NOT create fictional responses or paraphrase things that were never said.
+D. For commitments_made: ONLY include promises explicitly made during the call. Return [] if none.
+E. For customer_requests: ONLY include requests the customer actually verbalized. Return [] if none.
+F. For topics_discussed: ONLY include topics that actually came up in conversation. Return [] if none.
+G. When in doubt, use null or empty array [] - it is ALWAYS better to leave a field empty than to fabricate content.
+H. Every piece of information in your output must be traceable to a specific part of the transcript.
+
+*** GENERAL RULES ***
+1. If something wasn't mentioned, use null or empty array []
+2. PHONE NUMBER FORMAT:
    - UAE numbers: +971-50-XXX-XXXX, +971-55-XXX-XXXX, +971-4-XXX-XXXX
    - If caller says "050-1234567", format as "+971-50-123-4567"
    - International numbers: include country code
-4. DEDUPLICATION: If a number/name is repeated for confirmation, count it ONCE only
-5. OTP CALLS: If the call is primarily about OTP verification, mark call_type as "otp_verification"
-6. Be SPECIFIC about services: "Golden Visa inquiry for property investment" not just "visa inquiry"
-7. MOOD ANALYSIS: Base mood assessment on actual tone indicators (urgency words, politeness, complaints, thanks).
+3. DEDUPLICATION: If a number/name is repeated for confirmation, count it ONCE only
+4. OTP CALLS: If the call is primarily about OTP verification, mark call_type as "otp_verification"
+5. Be SPECIFIC about services: "Golden Visa inquiry for property investment" not just "visa inquiry"
+6. MOOD ANALYSIS: Base mood assessment on actual tone indicators (urgency words, politeness, complaints, thanks).
    - If the call is very short (under 1 minute of actual conversation), has minimal back-and-forth, or the customer disconnected/hung up mid-call, sentiment should be "neutral" or "negative" - NEVER "positive"
    - Do NOT mark sentiment as "positive" just because staff greeted politely if no real conversation happened
    - If the customer disconnected before discussion could happen, mark overall_sentiment as "negative" or "neutral" and note "customer_disconnected" in frustration_indicators
    - "positive" sentiment requires actual positive indicators: customer expressed satisfaction, thanked staff, agreed to proceed, or showed genuine interest
-8. EMPLOYEE PERFORMANCE: Be objective and constructive - provide actionable feedback
-9. SALES OPPORTUNITIES: Identify potential business opportunities and qualify leads
-10. STAFF IDENTIFICATION: Use extension directory to identify staff when possible
-11. COMPLIANCE: Note any compliance concerns or data handling issues
-12. COACHING: Provide specific coaching notes that would help improve performance
+7. EMPLOYEE PERFORMANCE: Be objective and constructive - provide actionable feedback
+8. SALES OPPORTUNITIES: Identify potential business opportunities and qualify leads
+9. STAFF IDENTIFICATION: Use extension directory to identify staff when possible
+10. COMPLIANCE: Note any compliance concerns or data handling issues
+11. COACHING: Provide specific coaching notes that would help improve performance
 
 Return ONLY valid JSON, no other text."""
 
@@ -676,7 +687,7 @@ class WhisperEngine:
         self._diarization_loaded = False
         self._loading = False
         self._lock = asyncio.Lock()
-        self._gpu_lock = threading.Semaphore(3)  # Allow up to 3 concurrent GPU inferences
+        self._gpu_lock = threading.Semaphore(1)  # Sequential GPU inference (queue enforces ordering)
         self._device = None
         self._hf_token = os.environ.get("HF_TOKEN")  # HuggingFace token for pyannote
 
@@ -713,7 +724,7 @@ class WhisperEngine:
 
                 # Use whisper-large-v3 for better multilingual accuracy (Hindi, Malayalam, Arabic)
                 # Note: large-v3 is slower but more accurate than turbo variant for non-English
-                model_id = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3")
+                model_id = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
                 torch_dtype = torch.float16 if "cuda" in self._device else torch.float32
 
                 logger.info(f"Loading Whisper model: {model_id} on {self._device}")
@@ -1346,6 +1357,7 @@ class AITranscriptionService:
         audio_path: str,
         language_hint: Optional[str] = None,
         recording_file: Optional[str] = None,
+        stage_callback: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """Full pipeline: Transcribe and analyze."""
         import re
@@ -1382,6 +1394,8 @@ class AITranscriptionService:
                 recording_context += f"\nCall Direction: Internal (Call between staff members)"
 
         # Step 1: Transcribe
+        if stage_callback:
+            await stage_callback("transcribing")
         logger.info(f"Starting transcription for: {audio_path}")
         transcription = await self.transcribe_audio(audio_path, language_hint)
 
@@ -1441,6 +1455,8 @@ class AITranscriptionService:
         logger.info(f"Transcription complete, analyzing with {settings.ollama_model} for department: {staff_department or 'Unknown'}...")
 
         # Step 2: Analyze with recording context and department-specific prompts
+        if stage_callback:
+            await stage_callback("analyzing")
         analysis = await self._llm_service.analyze_transcript(transcript, recording_context, staff_department)
 
         processing_time = (datetime.now() - start_time).total_seconds()

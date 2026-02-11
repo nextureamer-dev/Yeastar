@@ -237,6 +237,16 @@ async def lifespan(app: FastAPI):
     subscribe("Hangup", lambda data: forward_to_websocket({"type": "call_ended", **data}))
     subscribe("AnswerCall", lambda data: forward_to_websocket({"type": "call_answered", **data}))
 
+    # Initialize and start the processing queue
+    from app.services.processing_queue import get_processing_queue
+    from app.routers.transcription import _process_recording_task
+
+    queue = get_processing_queue()
+    queue.set_process_function(_process_recording_task)
+    queue.set_broadcast_function(ws_manager.broadcast)
+    await queue.start()
+    logger.info("Processing queue started")
+
     # Start CDR polling background task for auto-processing
     if settings.auto_process_calls:
         import threading
@@ -271,6 +281,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down Yeastar CRM API...")
+
+    # Stop processing queue
+    from app.services.processing_queue import get_processing_queue
+    queue = get_processing_queue()
+    await queue.stop()
+    logger.info("Processing queue stopped")
 
     # Stop CDR poller
     if _cdr_poller_task and _shutdown_event:

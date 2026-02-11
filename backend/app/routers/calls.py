@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, desc, and_, func
+from sqlalchemy import or_, desc, and_, func, text, literal
+from sqlalchemy.orm import aliased
 from typing import Optional, List
 from datetime import datetime, timedelta
 
@@ -276,6 +277,14 @@ async def _get_call_stats_from_api(days: int, current_user: User):
     total_duration = 0
     answered_count_for_avg = 0
 
+    # Track inbound calls for round-robin dedup
+    missed_inbound = []  # (normalized_caller, call_time)
+    answered_inbound = []  # (normalized_caller, call_time)
+
+    def _normalize_phone(num: str) -> str:
+        """Normalize phone for comparison: +971 -> 0, strip +"""
+        return num.replace('+971', '0').replace('+', '')
+
     # Fetch pages to calculate stats
     max_pages = 20
     found_older_than_cutoff = False
@@ -340,8 +349,19 @@ async def _get_call_stats_from_api(days: int, current_user: User):
                 answered_calls += 1
                 total_duration += cdr.get("talk_duration", 0) or cdr.get("duration", 0)
                 answered_count_for_avg += 1
+                if cdr_call_type == "inbound" and call_time:
+                    answered_inbound.append((_normalize_phone(cdr.get("call_from_number", "")), call_time))
             elif disposition in ("NO ANSWER", "VOICEMAIL", "BUSY"):
                 missed_calls += 1
+                if cdr_call_type == "inbound" and call_time:
+                    missed_inbound.append((_normalize_phone(cdr.get("call_from_number", "")), call_time))
+
+    # Dedup: subtract missed inbound calls that were answered by another agent within 2 min
+    for missed_caller, missed_time in missed_inbound:
+        for ans_caller, ans_time in answered_inbound:
+            if missed_caller == ans_caller and abs((missed_time - ans_time).total_seconds()) <= 120:
+                missed_calls -= 1
+                break
 
     # Calculate totals
     avg_duration = total_duration / answered_count_for_avg if answered_count_for_avg > 0 else 0
@@ -435,12 +455,37 @@ async def get_call_stats(
 
     # Process status counts
     answered_calls = 0
-    missed_calls = 0
+    raw_missed_calls = 0
     for status, count in status_counts:
         if status == CallStatus.ANSWERED:
             answered_calls = count
         elif status in (CallStatus.NO_ANSWER, CallStatus.MISSED, CallStatus.VOICEMAIL, CallStatus.BUSY):
-            missed_calls += count
+            raw_missed_calls += count
+
+    # Exclude missed inbound calls that were answered by another agent (round-robin)
+    # A missed call is "resolved" if the same caller had an answered inbound call within 2 minutes
+    answered_alias = aliased(CallLog)
+    resolved_missed_count = db.query(func.count(CallLog.id)).filter(
+        and_(
+            base_filter,
+            CallLog.status.in_([CallStatus.NO_ANSWER, CallStatus.MISSED, CallStatus.VOICEMAIL, CallStatus.BUSY]),
+            CallLog.direction == CallDirection.INBOUND,
+            db.query(literal(1)).filter(
+                and_(
+                    answered_alias.status == CallStatus.ANSWERED,
+                    answered_alias.direction == CallDirection.INBOUND,
+                    answered_alias.id != CallLog.id,
+                    # Match caller number (normalize +971 vs 0 prefix)
+                    func.replace(func.replace(answered_alias.caller_number, '+971', '0'), '+', '') ==
+                    func.replace(func.replace(CallLog.caller_number, '+971', '0'), '+', ''),
+                    # Within 2 minutes of each other
+                    func.abs(func.timestampdiff(text('SECOND'), CallLog.start_time, answered_alias.start_time)) <= 120,
+                )
+            ).exists()
+        )
+    ).scalar() or 0
+
+    missed_calls = raw_missed_calls - resolved_missed_count
 
     # Calculate totals
     total_duration = duration_result.total_duration or 0 if duration_result else 0

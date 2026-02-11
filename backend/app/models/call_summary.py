@@ -2,9 +2,12 @@
 
 from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, ForeignKey, Boolean, Float
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from app.database import Base
+
+# Dubai timezone (UTC+4)
+_dubai_tz = timezone(timedelta(hours=4))
 
 
 class CallSummary(Base):
@@ -146,9 +149,21 @@ class CallSummary(Base):
     model_used = Column(String(50), nullable=True)
     error_message = Column(Text, nullable=True)
 
-    # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Timestamps (stored in Asia/Dubai timezone)
+    created_at = Column(DateTime, default=lambda: datetime.now(_dubai_tz), index=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(_dubai_tz), onupdate=lambda: datetime.now(_dubai_tz))
+
+    @staticmethod
+    def parse_call_time_from_id(call_id: str):
+        """Parse actual call time from Yeastar call_id (format: YYYYMMDDHHmmss...)."""
+        if call_id and len(call_id) >= 14:
+            try:
+                time_part = call_id[:14]
+                dt = datetime.strptime(time_part, "%Y%m%d%H%M%S")
+                return dt.replace(tzinfo=_dubai_tz)
+            except (ValueError, TypeError):
+                pass
+        return None
 
     def to_dict(self):
         """Convert to dictionary."""
