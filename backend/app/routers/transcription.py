@@ -310,6 +310,8 @@ async def list_summaries(
         query = query.filter(CallSummary.feedback_rating.isnot(None))
     elif has_feedback == 'no':
         query = query.filter(CallSummary.feedback_rating.is_(None))
+    elif has_feedback == 'disliked':
+        query = query.filter(CallSummary.feedback_rating == 1)
 
     # Count total - need a separate query that includes the CallLog join for extension matching
     count_query = db.query(func.count(CallSummary.id)).outerjoin(
@@ -363,6 +365,8 @@ async def list_summaries(
         count_query = count_query.filter(CallSummary.feedback_rating.isnot(None))
     elif has_feedback == 'no':
         count_query = count_query.filter(CallSummary.feedback_rating.is_(None))
+    elif has_feedback == 'disliked':
+        count_query = count_query.filter(CallSummary.feedback_rating == 1)
     total_count = count_query.scalar()
 
     # Order by call time (from CallLog) if available, otherwise by summary created_at
@@ -677,8 +681,8 @@ async def get_staff_call_metrics(
                 metrics["missed"] += 1
                 missed_inbound_records.append((matched_ext, _normalize_phone(caller)))
 
-        # Check if this call has a pending AI summary
-        if status_str == 'answered' and call_id not in processed_call_ids:
+        # Check if this call has a pending AI summary (inbound/outbound only)
+        if status_str == 'answered' and dir_str != 'internal' and call_id not in processed_call_ids:
             metrics["pending_summary"] += 1
 
     # Round-robin dedup: subtract missed inbound calls where same caller was answered
@@ -789,6 +793,9 @@ async def get_call_analytics(
                 category = type_mapping.get(t, 'Other')
                 categories[category] = categories.get(category, 0) + count
 
+    # Count by feedback
+    disliked_count = base_query.filter(CallSummary.feedback_rating == 1).count()
+
     # Get recent summaries for display
     recent_summaries = base_query.order_by(CallSummary.created_at.desc()).limit(5).all()
 
@@ -798,6 +805,7 @@ async def get_call_analytics(
         "by_category": categories,
         "by_call_type": {ct: count for ct, count in call_type_counts if ct},
         "by_sentiment": {s: count for s, count in sentiment_counts if s},
+        "disliked_count": disliked_count,
         "recent_summaries": [
             {
                 "call_id": s.call_id,
@@ -1657,12 +1665,26 @@ async def analyze_contact_history(
     a comprehensive issue summary using the LLM.
     """
     from app.models.call_log import CallLog
+    from app.models.contact import Contact
 
-    # Find all call IDs for this phone number
-    call_logs = db.query(CallLog).filter(
-        (CallLog.caller_number.like(f'%{phone_number[-9:]}%')) |
-        (CallLog.callee_number.like(f'%{phone_number[-9:]}%'))
-    ).all()
+    # Find the contact by exact phone number match
+    clean_number = phone_number[-9:]
+    contact = db.query(Contact).filter(
+        (Contact.phone.like(f'%{clean_number}')) |
+        (Contact.phone_secondary.like(f'%{clean_number}'))
+    ).first()
+
+    # Find all call IDs for this contact using contact_id for precise matching
+    if contact:
+        call_logs = db.query(CallLog).filter(
+            CallLog.contact_id == contact.id
+        ).all()
+    else:
+        # Fallback: exact suffix match on phone numbers (no wildcard prefix on both sides)
+        call_logs = db.query(CallLog).filter(
+            (CallLog.caller_number.like(f'%{clean_number}')) |
+            (CallLog.callee_number.like(f'%{clean_number}'))
+        ).all()
 
     call_ids = [c.call_id for c in call_logs]
 
@@ -2244,6 +2266,7 @@ async def _process_recording_task(
                     existing.recording_file = recording_file
                     existing.language_detected = result.get("language_detected")
                     existing.transcript_preview = result.get("transcript_preview")
+                    existing.full_transcript = result.get("full_transcript")
                     existing.call_type = summary_data.get("call_type")
                     existing.service_category = summary_data.get("service_category")
                     existing.service_subcategory = summary_data.get("service_subcategory")
@@ -2334,6 +2357,7 @@ async def _process_recording_task(
                         recording_file=recording_file,
                         language_detected=result.get("language_detected"),
                         transcript_preview=result.get("transcript_preview"),
+                        full_transcript=result.get("full_transcript"),
                         call_type=summary_data.get("call_type"),
                         service_category=summary_data.get("service_category"),
                         service_subcategory=summary_data.get("service_subcategory"),
@@ -2800,8 +2824,8 @@ async def get_qualifier_analytics(
 
     # Compliance metrics
     calls_with_missing = sum(1 for c in qualifier_calls if c.qualifier_missing_fields and len(c.qualifier_missing_fields) > 0)
-    appointment_offered = sum(1 for c in qualifier_calls if c.qualifier_appointment_offered is True)
     high_value_calls = [c for c in qualifier_calls if c.star_rating and c.star_rating >= 4]
+    appointment_offered = sum(1 for c in high_value_calls if c.qualifier_appointment_offered is True)
 
     compliance = {
         "calls_with_missing_fields": calls_with_missing,

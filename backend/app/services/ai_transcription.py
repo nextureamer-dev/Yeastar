@@ -746,7 +746,57 @@ class WhisperEngine:
 
                     processor = AutoProcessor.from_pretrained(model_id)
 
-                    return pipeline(
+                    # Fix float forced_decoder_ids in model configs BEFORE creating pipeline
+                    # transformers 5.x can produce float token IDs which cause
+                    # "'float' object cannot be interpreted as an integer" in PyTorch
+                    def _fix_decoder_ids(ids):
+                        if not ids:
+                            return ids
+                        fixed = []
+                        for pair in ids:
+                            if pair is None:
+                                continue
+                            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                                if pair[0] is not None and pair[1] is not None:
+                                    fixed.append((int(pair[0]), int(pair[1])))
+                        return fixed if fixed else None
+
+                    if hasattr(model, 'config') and hasattr(model.config, 'forced_decoder_ids'):
+                        model.config.forced_decoder_ids = _fix_decoder_ids(model.config.forced_decoder_ids)
+                    if hasattr(model, 'generation_config') and hasattr(model.generation_config, 'forced_decoder_ids'):
+                        model.generation_config.forced_decoder_ids = _fix_decoder_ids(model.generation_config.forced_decoder_ids)
+
+                    # Monkey-patch model.generate to fix float forced_decoder_ids
+                    # at ALL levels: kwargs, generation_config arg, and model's own config
+                    _original_generate = model.generate
+
+                    def _patched_generate(*args, **kwargs):
+                        # Fix forced_decoder_ids in direct kwargs
+                        if 'forced_decoder_ids' in kwargs and kwargs['forced_decoder_ids'] is not None:
+                            kwargs['forced_decoder_ids'] = _fix_decoder_ids(kwargs['forced_decoder_ids'])
+                        # Fix in generation_config kwarg
+                        gen_config = kwargs.get('generation_config')
+                        if gen_config is not None and hasattr(gen_config, 'forced_decoder_ids') and gen_config.forced_decoder_ids is not None:
+                            gen_config.forced_decoder_ids = _fix_decoder_ids(gen_config.forced_decoder_ids)
+                        # Fix in model's own generation_config (may be recreated by pipeline)
+                        if hasattr(model, 'generation_config') and hasattr(model.generation_config, 'forced_decoder_ids') and model.generation_config.forced_decoder_ids is not None:
+                            model.generation_config.forced_decoder_ids = _fix_decoder_ids(model.generation_config.forced_decoder_ids)
+                        if hasattr(model, 'config') and hasattr(model.config, 'forced_decoder_ids') and model.config.forced_decoder_ids is not None:
+                            model.config.forced_decoder_ids = _fix_decoder_ids(model.config.forced_decoder_ids)
+                        return _original_generate(*args, **kwargs)
+
+                    model.generate = _patched_generate
+
+                    # Also patch tokenizer's get_decoder_prompt_ids to return int IDs
+                    tokenizer = processor.tokenizer
+                    if hasattr(tokenizer, 'get_decoder_prompt_ids'):
+                        _orig_get_decoder_prompt_ids = tokenizer.get_decoder_prompt_ids
+                        def _fixed_get_decoder_prompt_ids(*args, **kwargs):
+                            ids = _orig_get_decoder_prompt_ids(*args, **kwargs)
+                            return _fix_decoder_ids(ids)
+                        tokenizer.get_decoder_prompt_ids = _fixed_get_decoder_prompt_ids
+
+                    pipe = pipeline(
                         "automatic-speech-recognition",
                         model=model,
                         tokenizer=processor.tokenizer,
@@ -754,6 +804,8 @@ class WhisperEngine:
                         torch_dtype=torch_dtype,
                         device=self._device,
                     )
+
+                    return pipe
 
                 self._pipe = await loop.run_in_executor(None, _load)
                 self._model_loaded = True
@@ -887,7 +939,8 @@ class WhisperEngine:
                 return await self._do_transcribe(audio_path, language)
 
         except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
+            import traceback
+            logger.error(f"Whisper transcription failed: {e}\n{traceback.format_exc()}")
             return {
                 "success": False,
                 "error": str(e)
@@ -922,16 +975,7 @@ class WhisperEngine:
                     # This is crucial for Hindi, Malayalam, Arabic calls
                     generate_kwargs["task"] = "transcribe"
 
-                # Domain-specific prompt for better context (Whisper supports initial_prompt)
-                # This helps with business-specific vocabulary
-                domain_prompt = (
-                    "This is a phone call at a government service center in Dubai, UAE. "
-                    "Common terms: Emirates ID, visa, Golden Visa, residence permit, "
-                    "attestation, trade license, company formation, PRO services, "
-                    "Amer Centre, Nexture, GDRFA, ICP, medical fitness, typing services."
-                )
-
-                with self._gpu_lock:  # Up to 3 concurrent GPU inferences
+                with self._gpu_lock:  # Sequential GPU inference
                     result = self._pipe(
                         audio_path,
                         chunk_length_s=30,
@@ -1041,7 +1085,8 @@ class WhisperEngine:
             }
 
         except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
+            import traceback
+            logger.error(f"Whisper transcription failed: {e}\n{traceback.format_exc()}")
             return {
                 "success": False,
                 "error": str(e)
@@ -1130,7 +1175,7 @@ class LLMAnalysisService:
                             {"role": "user", "content": prompt}
                         ],
                         "temperature": 0.3,
-                        "max_tokens": 2000,
+                        "max_tokens": 15000,
                     }
                 )
                 response.raise_for_status()
@@ -1157,10 +1202,11 @@ class LLMAnalysisService:
                     json={
                         "model": self.ollama_model,
                         "prompt": prompt,
+                        "format": "json",
                         "stream": False,
                         "options": {
                             "temperature": 0.3,
-                            "num_predict": 2000,
+                            "num_predict": 15000,
                             "num_ctx": settings.ollama_context_length,
                         }
                     }
@@ -1168,7 +1214,9 @@ class LLMAnalysisService:
                 response.raise_for_status()
                 result = response.json()
 
-                return self._parse_llm_response(result.get("response", ""))
+                raw_response = result.get("response", "")
+                logger.info(f"Ollama response length: {len(raw_response)} chars, has JSON: {'{' in raw_response}")
+                return self._parse_llm_response(raw_response)
 
         except httpx.ConnectError:
             logger.error(f"Cannot connect to Ollama server at {self.ollama_url}")
@@ -1210,6 +1258,31 @@ class LLMAnalysisService:
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse failed: {e}")
 
+        # Second attempt: try to repair truncated JSON by closing open braces/brackets
+        try:
+            start = response_text.find("{")
+            if start >= 0:
+                json_str = response_text[start:]
+                # Remove control characters
+                json_str = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_str)
+                # Remove trailing comma and incomplete key/value
+                json_str = re.sub(r',\s*"[^"]*"\s*:\s*(?:"[^"]*)?$', '', json_str)
+                json_str = re.sub(r',\s*$', '', json_str)
+                # Count unclosed braces/brackets and close them
+                open_braces = json_str.count('{') - json_str.count('}')
+                open_brackets = json_str.count('[') - json_str.count(']')
+                if open_brackets > 0:
+                    json_str += ']' * open_brackets
+                if open_braces > 0:
+                    json_str += '}' * open_braces
+                # Clean trailing commas before closing
+                json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+                data = json.loads(json_str)
+                logger.info("JSON repaired after truncation")
+                return {"success": True, "data": data}
+        except json.JSONDecodeError:
+            logger.warning("JSON repair also failed, falling back to manual extraction")
+
         # Fallback: manual extraction
         return {
             "success": True,
@@ -1226,8 +1299,8 @@ class LLMAnalysisService:
         if call_type_match:
             result["call_type"] = call_type_match.group(1)
 
-        # Extract summary
-        summary_match = re.search(r'"summary"\s*:\s*"([^"]*(?:[^"\\]|\\.)*)"', response_text)
+        # Extract summary (handle escaped quotes properly)
+        summary_match = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', response_text)
         if summary_match:
             result["summary"] = summary_match.group(1).replace('\\"', '"').replace('\\n', ' ')
 
@@ -1272,6 +1345,7 @@ class LLMAnalysisService:
             result["key_details"] = key_details
 
         if "summary" not in result:
+            logger.error(f"Manual extraction failed to find summary. Extracted keys: {list(result.keys())}. Response starts with: {response_text[:200]}")
             result["summary"] = "Summary could not be parsed from AI response"
             result["error"] = "JSON parsing failed - fields extracted manually"
 

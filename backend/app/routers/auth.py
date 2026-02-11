@@ -13,11 +13,14 @@ from app.schemas.user import (
     UserAdminUpdate,
     Token,
     LoginRequest,
+    ChangePassword,
+    ResetPassword,
 )
 from app.services.auth import (
     authenticate_user,
     create_access_token,
     get_password_hash,
+    verify_password,
     get_current_user_required,
     get_admin_user,
     get_superadmin_user,
@@ -149,6 +152,49 @@ def update_current_user(
     db.commit()
     db.refresh(user)
     return UserResponse.model_validate(user)
+
+
+@router.post("/change-password")
+def change_password(
+    data: ChangePassword,
+    user: User = Depends(get_current_user_required),
+    db: Session = Depends(get_db),
+):
+    """Change own password (requires current password)."""
+    if not verify_password(data.current_password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+    if len(data.new_password) < 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 4 characters",
+        )
+    user.hashed_password = get_password_hash(data.new_password)
+    db.commit()
+    return {"status": "ok", "message": "Password changed successfully"}
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(
+    user_id: int,
+    data: ResetPassword,
+    admin: User = Depends(get_superadmin_user),
+    db: Session = Depends(get_db),
+):
+    """Reset a user's password (superadmin only)."""
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if len(data.new_password) < 4:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 4 characters",
+        )
+    target_user.hashed_password = get_password_hash(data.new_password)
+    db.commit()
+    return {"status": "ok", "message": f"Password reset for {target_user.username}"}
 
 
 @router.get("/users", response_model=list[UserResponse])

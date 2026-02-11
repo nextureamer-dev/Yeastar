@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # LLM Configuration (Ollama with Llama 3.1 8B - fast and accurate)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
-    ollama_context_length: int = 16384  # Increased for detailed analysis prompt
+    ollama_context_length: int = 32768  # Large enough for prompt + 15k output tokens
 
     # Auto-processing Configuration
     auto_process_calls: bool = True

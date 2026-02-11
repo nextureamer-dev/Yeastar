@@ -22,6 +22,7 @@ class CallSummary(Base):
     # Transcription info
     language_detected = Column(String(20), nullable=True)
     transcript_preview = Column(Text, nullable=True)  # First 500 chars
+    full_transcript = Column(Text, nullable=True)  # Full transcript text
 
     # Call classification
     call_type = Column(String(50), nullable=True, index=True)  # visa_inquiry, emirates_id, company_setup, etc.
@@ -178,6 +179,7 @@ class CallSummary(Base):
             "recording_file": self.recording_file,
             "language_detected": self.language_detected,
             "transcript_preview": self.transcript_preview,
+            "full_transcript": self.full_transcript,
 
             # Call classification
             "call_type": self.call_type,
